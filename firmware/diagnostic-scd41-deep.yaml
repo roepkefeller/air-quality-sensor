@@ -1,0 +1,198 @@
+# DEEP DIAGNOSTIC CONFIG — bypasses ESPHome SCD4x driver, uses raw I2C
+# to interrogate the chip directly. Reveals chip variant, serial,
+# and lets us manually stop/start and check data-ready.
+
+esphome:
+  name: air-quality-sensor
+  friendly_name: Air Quality Sensor
+  on_boot:
+    priority: -100   # run after all components initialized
+    then:
+      - delay: 3s
+      - script.execute: full_diagnostic
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "e2nRX9doZnRav1ZcZYL2S5lRmCTXi/vQ5gjhxwQZTag="
+
+ota:
+  - platform: esphome
+    password: "airqualitysensorota"
+
+wifi:
+  # ssid: !secret wifi_ssid
+  # password: !secret wifi_password
+  ap:
+    ssid: "Air-Quality Fallback"
+    password: "configureme"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+i2c:
+  id: bus_a
+  sda: GPIO7
+  scl: GPIO8
+  scan: true
+  frequency: 50kHz
+
+# Register the SCD41 as a raw I2C device (not as a scd4x sensor)
+# so we can send arbitrary commands to it.
+i2c_device:
+  - id: scd41_raw
+    address: 0x62
+
+button:
+  - platform: template
+    name: "Run full diagnostic"
+    on_press:
+      - script.execute: full_diagnostic
+
+  - platform: template
+    name: "Stop measurements"
+    on_press:
+      - script.execute: stop_measurements
+
+  - platform: template
+    name: "Start periodic measurements"
+    on_press:
+      - script.execute: start_measurements
+
+  - platform: template
+    name: "Check data ready"
+    on_press:
+      - script.execute: check_data_ready
+
+  - platform: template
+    name: "Read serial + variant"
+    on_press:
+      - script.execute: read_identity
+
+  - platform: restart
+    name: "Restart ESP"
+
+# ---------------------------------------------------------------------------
+# Diagnostic scripts
+# ---------------------------------------------------------------------------
+script:
+  - id: full_diagnostic
+    mode: single
+    then:
+      - logger.log: "=== SCD41 FULL DIAGNOSTIC ==="
+      - script.execute: stop_measurements
+      - delay: 1s
+      - script.execute: read_identity
+      - delay: 500ms
+      - script.execute: start_measurements
+      - delay: 6s   # Give the first measurement time to complete
+      - script.execute: check_data_ready
+      - delay: 5s
+      - script.execute: check_data_ready
+      - delay: 5s
+      - script.execute: check_data_ready
+      - logger.log: "=== DIAGNOSTIC DONE ==="
+
+  - id: stop_measurements
+    then:
+      - logger.log: ">> Sending STOP_MEASUREMENTS (0x3f86)"
+      - lambda: |-
+          uint8_t cmd[2] = {0x3f, 0x86};
+          auto err = id(scd41_raw).write(cmd, 2);
+          if (err == i2c::ERROR_OK) {
+            ESP_LOGI("diag", "  STOP: OK (wait 500ms before next cmd)");
+          } else {
+            ESP_LOGE("diag", "  STOP: I2C error %d", (int) err);
+          }
+      - delay: 500ms
+
+  - id: start_measurements
+    then:
+      - logger.log: ">> Sending START_PERIODIC_MEASUREMENTS (0x21b1)"
+      - lambda: |-
+          uint8_t cmd[2] = {0x21, 0xb1};
+          auto err = id(scd41_raw).write(cmd, 2);
+          if (err == i2c::ERROR_OK) {
+            ESP_LOGI("diag", "  START: OK");
+          } else {
+            ESP_LOGE("diag", "  START: I2C error %d", (int) err);
+          }
+
+  - id: check_data_ready
+    then:
+      - logger.log: ">> Checking GET_DATA_READY_STATUS (0xe4b8)"
+      - lambda: |-
+          uint8_t cmd[2] = {0xe4, 0xb8};
+          auto werr = id(scd41_raw).write(cmd, 2);
+          if (werr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Write failed: %d", (int) werr);
+            return;
+          }
+          delay(1);
+          uint8_t buf[3] = {0};
+          auto rerr = id(scd41_raw).read(buf, 3);
+          if (rerr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Read failed: %d", (int) rerr);
+            return;
+          }
+          uint16_t word = (buf[0] << 8) | buf[1];
+          uint16_t low11 = word & 0x07ff;
+          ESP_LOGI("diag", "  Raw bytes: 0x%02X 0x%02X (CRC 0x%02X)", buf[0], buf[1], buf[2]);
+          ESP_LOGI("diag", "  Word: 0x%04X  low11: 0x%03X  DATA_READY: %s",
+                   word, low11, (low11 != 0) ? "YES" : "NO");
+
+  - id: read_identity
+    then:
+      - logger.log: ">> Reading SERIAL_NUMBER (0x3682)"
+      - lambda: |-
+          uint8_t cmd[2] = {0x36, 0x82};
+          auto werr = id(scd41_raw).write(cmd, 2);
+          if (werr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Write failed: %d", (int) werr);
+            return;
+          }
+          delay(1);
+          uint8_t buf[9] = {0};
+          auto rerr = id(scd41_raw).read(buf, 9);
+          if (rerr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Read failed: %d", (int) rerr);
+            return;
+          }
+          ESP_LOGI("diag", "  Serial: %02X%02X %02X%02X %02X%02X (CRCs: %02X %02X %02X)",
+                   buf[0], buf[1], buf[3], buf[4], buf[6], buf[7],
+                   buf[2], buf[5], buf[8]);
+      - delay: 500ms
+      - logger.log: ">> Reading SENSOR_VARIANT (0x202f)"
+      - lambda: |-
+          uint8_t cmd[2] = {0x20, 0x2f};
+          auto werr = id(scd41_raw).write(cmd, 2);
+          if (werr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Write failed: %d", (int) werr);
+            return;
+          }
+          delay(1);
+          uint8_t buf[3] = {0};
+          auto rerr = id(scd41_raw).read(buf, 3);
+          if (rerr != i2c::ERROR_OK) {
+            ESP_LOGE("diag", "  Read failed: %d", (int) rerr);
+            return;
+          }
+          uint16_t variant = (buf[0] << 8) | buf[1];
+          const char* name = "UNKNOWN";
+          switch (variant & 0xF000) {
+            case 0x0000: name = "SCD40"; break;
+            case 0x1000: name = "SCD41"; break;
+            case 0x2000: name = "SCD42"; break;
+            case 0x5000: name = "SCD43"; break;
+          }
+          ESP_LOGI("diag", "  Raw variant: 0x%04X -> %s", variant, name);

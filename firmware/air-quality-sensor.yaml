@@ -1,0 +1,263 @@
+# ESPHome configuration for custom air quality PCB
+# Board: ESP32-C3
+# Sensors: BMP280, SCD41, SGP41, SHT40 (all I2C)
+# Indicators: WS2812 RGB LED (air quality), standard LED (fault)
+
+esphome:
+  name: air-quality-sensor
+  friendly_name: Air Quality Sensor
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+
+logger:
+  # Reduce noise from the SCD41 if it keeps complaining
+  level: DEBUG
+  logs:
+    scd4x: WARN
+
+api:
+  encryption:
+    key: "e2nRX9doZnRav1ZcZYL2S5lRmCTXi/vQ5gjhxwQZTag="
+
+ota:
+  - platform: esphome
+    password: "airqualitysensorota"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Air-Quality Fallback"
+    password: "configureme"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# ---------------------------------------------------------------------------
+# I2C bus
+# ---------------------------------------------------------------------------
+i2c:
+  sda: GPIO7
+  scl: GPIO8
+  scan: true
+  frequency: 50kHz
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+sensor:
+  # --- SHT40: temperature + humidity (high accuracy) ---
+  - platform: sht4x
+    address: 0x44
+    update_interval: 30s
+    temperature:
+      name: "Temperature (SHT40)"
+      id: sht40_temperature
+    humidity:
+      name: "Humidity (SHT40)"
+      id: sht40_humidity
+
+  # --- BMP280: pressure + temperature ---
+  - platform: bmp280_i2c
+    address: 0x76
+    update_interval: 30s
+    temperature:
+      name: "Temperature (BMP280)"
+      oversampling: 16x
+    pressure:
+      name: "Pressure"
+      id: bmp280_pressure
+
+  # --- SCD41: CO2, temperature, humidity ---
+  # Kept in config in case it starts working. If it stays silent, the
+  # fault LED indicates this and VOC becomes the fallback air-quality signal.
+  - platform: scd4x
+    id: scd41_sensor
+    address: 0x62
+    update_interval: 30s
+    measurement_mode: periodic
+    ambient_pressure_compensation_source: bmp280_pressure
+    co2:
+      name: "CO2"
+      id: co2_value
+      on_value:
+        then:
+          - script.execute: update_air_quality_led
+    temperature:
+      name: "Temperature (SCD41)"
+    humidity:
+      name: "Humidity (SCD41)"
+
+  # --- SGP41: VOC + NOx index (with humidity compensation from SHT40) ---
+  - platform: sgp4x
+    update_interval: 30s
+    compensation:
+      humidity_source: sht40_humidity
+      temperature_source: sht40_temperature
+    voc:
+      name: "VOC Index"
+      id: voc_index
+      on_value:
+        then:
+          # VOC drives the LED as a fallback when CO2 isn't available
+          - script.execute: update_air_quality_led
+    nox:
+      name: "NOx Index"
+      id: nox_index
+
+# ---------------------------------------------------------------------------
+# Lights: WS2812 air-quality indicator (GPIO6) and fault LED (GPIO5)
+# ---------------------------------------------------------------------------
+output:
+  - platform: gpio
+    pin: GPIO5
+    id: fault_led_output
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: air_quality_led
+    name: "Air Quality LED"
+    pin: GPIO6
+    num_leds: 1
+    rgb_order: GRB
+    chipset: WS2812
+    default_transition_length: 500ms
+    restore_mode: ALWAYS_OFF
+
+  - platform: binary
+    id: fault_led
+    name: "Fault LED"
+    output: fault_led_output
+    restore_mode: ALWAYS_OFF
+
+# ---------------------------------------------------------------------------
+# Buttons for diagnostics / recovery (accessible via web UI)
+# ---------------------------------------------------------------------------
+button:
+  - platform: template
+    name: "SCD41 Factory Reset"
+    on_press:
+      - lambda: 'id(scd41_sensor).factory_reset();'
+      - delay: 2s
+      - button.press: restart_esp_button
+
+  - platform: restart
+    id: restart_esp_button
+    name: "Restart ESP"
+
+# ---------------------------------------------------------------------------
+# Air-quality color logic
+# Prefers CO2 from SCD41 if available; falls back to VOC index from SGP41.
+# ---------------------------------------------------------------------------
+script:
+  - id: update_air_quality_led
+    then:
+      - if:
+          condition:
+            lambda: 'return id(co2_value).has_state() && !isnan(id(co2_value).state);'
+          then:
+            # CO2-based logic (preferred)
+            - if:
+                condition:
+                  lambda: 'return id(co2_value).state < 800;'
+                then:
+                  - light.turn_on:
+                      id: air_quality_led
+                      red: 0.0
+                      green: 1.0
+                      blue: 0.0
+                      brightness: 40%
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(co2_value).state < 1200;'
+                      then:
+                        - light.turn_on:
+                            id: air_quality_led
+                            red: 1.0
+                            green: 1.0
+                            blue: 0.0
+                            brightness: 50%
+                      else:
+                        - light.turn_on:
+                            id: air_quality_led
+                            red: 1.0
+                            green: 0.0
+                            blue: 0.0
+                            brightness: 60%
+          else:
+            # Fallback: VOC-based logic (SGP41 index: ~100 = normal baseline)
+            - if:
+                condition:
+                  lambda: 'return id(voc_index).has_state() && id(voc_index).state < 150;'
+                then:
+                  - light.turn_on:
+                      id: air_quality_led
+                      red: 0.0
+                      green: 1.0
+                      blue: 0.0
+                      brightness: 40%
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(voc_index).has_state() && id(voc_index).state < 250;'
+                      then:
+                        - light.turn_on:
+                            id: air_quality_led
+                            red: 1.0
+                            green: 1.0
+                            blue: 0.0
+                            brightness: 50%
+                      else:
+                        - light.turn_on:
+                            id: air_quality_led
+                            red: 1.0
+                            green: 0.0
+                            blue: 0.0
+                            brightness: 60%
+
+# ---------------------------------------------------------------------------
+# Fault detection: fault LED is on whenever ANY sensor is missing data.
+# Re-evaluated whenever a sensor reports (via update_fault_state script call
+# in the on_value hooks above) AND every 30s as a backstop so we still catch
+# sensors going silent.
+# ---------------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "Sensor Fault"
+    id: sensor_fault
+    device_class: problem
+    lambda: |-
+      bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
+      bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
+      bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
+      bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
+      return !(scd_ok && sht_ok && bmp_ok && voc_ok);
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: 'return x;'
+            then:
+              - light.turn_on: fault_led
+            else:
+              - light.turn_off: fault_led
+
+# Periodically recompute the fault state so we notice silent sensors.
+# Template binary_sensors aren't PollingComponents, so we re-trigger
+# their evaluation by publishing a fresh value via lambda.
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
+          bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
+          bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
+          bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
+          id(sensor_fault).publish_state(!(scd_ok && sht_ok && bmp_ok && voc_ok));
