@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# KiCad
+*.bak
+*.kicad_prl
+fp-info-cache
+*-backups/
+.history/
+
+# ESPHome
+firmware/.esphome/
+firmware/secrets.yaml
+
+# Fusion 360 / CAD cache
+*.autosave

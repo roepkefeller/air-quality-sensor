@@ -14,18 +14,15 @@ esp32:
     type: esp-idf
 
 logger:
-  # Reduce noise from the SCD41 if it keeps complaining
   level: DEBUG
-  logs:
-    scd4x: WARN
 
 api:
   encryption:
-    key: "e2nRX9doZnRav1ZcZYL2S5lRmCTXi/vQ5gjhxwQZTag="
+    key: !secret api_encryption_key
 
 ota:
   - platform: esphome
-    password: "airqualitysensorota"
+    password: !secret ota_password
 
 wifi:
   ssid: !secret wifi_ssid
@@ -38,6 +35,25 @@ captive_portal:
 
 web_server:
   port: 80
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+globals:
+  - id: brightness_initialized
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # Tracks whether we've set the LED color at least once since this boot.
+  - id: led_first_update_done
+    type: bool
+    restore_value: false   # resets to false on every boot
+    initial_value: 'false'
+  # Persists the user's last "on" / "off" choice across reboots.
+  - id: user_wants_led_on
+    type: bool
+    restore_value: true
+    initial_value: 'true'
 
 # ---------------------------------------------------------------------------
 # I2C bus
@@ -128,12 +144,27 @@ light:
     rgb_order: GRB
     chipset: WS2812
     default_transition_length: 500ms
-    restore_mode: ALWAYS_OFF
+    restore_mode: RESTORE_DEFAULT_OFF
+    # Track the user's last on/off intent so we can persist it across reboots
+    # and across sensor-update color changes.
+    on_turn_on:
+      - globals.set:
+          id: user_wants_led_on
+          value: 'true'
+    on_turn_off:
+      - globals.set:
+          id: user_wants_led_on
+          value: 'false'
+    effects:
+      - pulse:
+          name: "Pulse"
 
   - platform: binary
     id: fault_led
     name: "Fault LED"
     output: fault_led_output
+    # Fault LED is purely auto-controlled; always start off and let the
+    # fault logic drive it.
     restore_mode: ALWAYS_OFF
 
 # ---------------------------------------------------------------------------
@@ -147,6 +178,13 @@ button:
       - delay: 2s
       - button.press: restart_esp_button
 
+  - platform: template
+    name: "Test Fault LED"
+    on_press:
+      - light.turn_on: fault_led
+      - delay: 2s
+      - light.turn_off: fault_led
+
   - platform: restart
     id: restart_esp_button
     name: "Restart ESP"
@@ -154,73 +192,67 @@ button:
 # ---------------------------------------------------------------------------
 # Air-quality color logic
 # Prefers CO2 from SCD41 if available; falls back to VOC index from SGP41.
+# IMPORTANT: only the COLOR is set by firmware. Brightness and on/off state
+# are owned by the user (controllable from Home Assistant and persisted).
+# We read the current brightness and on/off state before updating color, then
+# re-apply them so the user's choices aren't clobbered.
 # ---------------------------------------------------------------------------
 script:
   - id: update_air_quality_led
     then:
-      - if:
-          condition:
-            lambda: 'return id(co2_value).has_state() && !isnan(id(co2_value).state);'
-          then:
-            # CO2-based logic (preferred)
-            - if:
-                condition:
-                  lambda: 'return id(co2_value).state < 800;'
-                then:
-                  - light.turn_on:
-                      id: air_quality_led
-                      red: 0.0
-                      green: 1.0
-                      blue: 0.0
-                      brightness: 40%
-                else:
-                  - if:
-                      condition:
-                        lambda: 'return id(co2_value).state < 1200;'
-                      then:
-                        - light.turn_on:
-                            id: air_quality_led
-                            red: 1.0
-                            green: 1.0
-                            blue: 0.0
-                            brightness: 50%
-                      else:
-                        - light.turn_on:
-                            id: air_quality_led
-                            red: 1.0
-                            green: 0.0
-                            blue: 0.0
-                            brightness: 60%
-          else:
-            # Fallback: VOC-based logic (SGP41 index: ~100 = normal baseline)
-            - if:
-                condition:
-                  lambda: 'return id(voc_index).has_state() && id(voc_index).state < 150;'
-                then:
-                  - light.turn_on:
-                      id: air_quality_led
-                      red: 0.0
-                      green: 1.0
-                      blue: 0.0
-                      brightness: 40%
-                else:
-                  - if:
-                      condition:
-                        lambda: 'return id(voc_index).has_state() && id(voc_index).state < 250;'
-                      then:
-                        - light.turn_on:
-                            id: air_quality_led
-                            red: 1.0
-                            green: 1.0
-                            blue: 0.0
-                            brightness: 50%
-                      else:
-                        - light.turn_on:
-                            id: air_quality_led
-                            red: 1.0
-                            green: 0.0
-                            blue: 0.0
-                            brightness: 60%
+      - lambda: |-
+          // Read current LED state for brightness.
+          auto current = id(air_quality_led).remote_values;
+          float brightness = current.get_brightness();
+
+          // On first boot ever, default to 25% brightness. After that,
+          // whatever the user sets in HA persists.
+          if (!id(brightness_initialized)) {
+            brightness = 0.25f;
+            id(brightness_initialized) = true;
+          }
+
+          // Decide the target color based on sensor data.
+          float r = 0.0f, g = 0.0f, b = 0.0f;
+          bool have_color = false;
+
+          if (id(co2_value).has_state() && !isnan(id(co2_value).state)) {
+            float co2 = id(co2_value).state;
+            if      (co2 < 800)  { r = 0.0f; g = 1.0f; b = 0.0f; }
+            else if (co2 < 1200) { r = 1.0f; g = 1.0f; b = 0.0f; }
+            else                 { r = 1.0f; g = 0.0f; b = 0.0f; }
+            have_color = true;
+          } else if (id(voc_index).has_state() && !isnan(id(voc_index).state)) {
+            float voc = id(voc_index).state;
+            if      (voc < 150) { r = 0.0f; g = 1.0f; b = 0.0f; }
+            else if (voc < 250) { r = 1.0f; g = 1.0f; b = 0.0f; }
+            else                { r = 1.0f; g = 0.0f; b = 0.0f; }
+            have_color = true;
+          }
+
+          if (!have_color) return;
+
+          // Respect the user's persistent on/off choice. If they turned
+          // it off in HA, we still update the color "next time", but we
+          // don't turn it on.
+          bool should_be_on = id(user_wants_led_on);
+
+          if (should_be_on) {
+            auto call = id(air_quality_led).turn_on();
+            call.set_rgb(r, g, b);
+            call.set_brightness(brightness);
+            call.set_transition_length(500);
+            call.perform();
+          } else {
+            // LED is off by user choice — make sure it stays off, but
+            // queue up the correct color for when they turn it back on.
+            auto call = id(air_quality_led).turn_off();
+            call.set_rgb(r, g, b);
+            call.set_brightness(brightness);
+            call.perform();
+          }
+
+          id(led_first_update_done) = true;
 
 # ---------------------------------------------------------------------------
 # Fault detection: fault LED is on whenever ANY sensor is missing data.

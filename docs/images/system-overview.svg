@@ -1,0 +1,141 @@
+<svg width="100%" viewBox="0 0 680 510" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Air Quality Sensor — system overview</title>
+<desc>Three-rail power architecture: TLV62569A to ESP32, TLV755P to SCD41, TPS7A20 to SGP41/SHT40/BMP280/QWIIC. All sensors share a 50 kHz I2C bus. ESP32 drives WS2812 RGB LED and fault LED via GPIO.</desc>
+<defs>
+<style>
+  text { font-family: sans-serif; fill: #1a1a1a; }
+  .th  { font-size: 12px; font-weight: 600; }
+  .ts  { font-size: 10px; font-weight: 400; fill: #555; }
+  .tl  { font-size: 9px; fill: #888; }
+  .gray   rect { fill: #f3f4f6; stroke: #9ca3af; stroke-width: 0.75; }
+  .gray   .th  { fill: #374151; }
+  .gray   .ts  { fill: #6b7280; }
+  .blue   rect { fill: #dbeafe; stroke: #3b82f6; stroke-width: 0.75; }
+  .blue   .th  { fill: #1e40af; }
+  .blue   .ts  { fill: #1d4ed8; }
+  .green  rect { fill: #d1fae5; stroke: #10b981; stroke-width: 0.75; }
+  .green  .th  { fill: #065f46; }
+  .green  .ts  { fill: #047857; }
+  .orange rect { fill: #ffedd5; stroke: #f97316; stroke-width: 0.75; }
+  .orange .th  { fill: #7c2d12; }
+  .orange .ts  { fill: #9a3412; }
+  .amber  rect { fill: #fef3c7; stroke: #f59e0b; stroke-width: 0.75; }
+  .amber  .th  { fill: #92400e; }
+  .amber  .ts  { fill: #b45309; }
+  .red    rect { fill: #fee2e2; stroke: #ef4444; stroke-width: 0.75; }
+  .red    .th  { fill: #991b1b; }
+  .red    .ts  { fill: #b91c1c; }
+</style>
+<marker id="a"  viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#9ca3af" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="ab" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#3b82f6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="ag" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#10b981" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="ao" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#f97316" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="ai" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#6366f1" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+
+<!-- ── LEFT COL: power input + regulators (x=20 w=110) ── -->
+<g class="gray"><rect x="20" y="15" width="110" height="36" rx="4"/>
+  <text x="75" y="29" text-anchor="middle" class="th">USB-C</text>
+  <text x="75" y="43" text-anchor="middle" class="ts">5 V input</text></g>
+
+<line x1="75" y1="51" x2="75" y2="60" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#a)"/>
+
+<g class="gray"><rect x="20" y="60" width="110" height="36" rx="4"/>
+  <text x="75" y="74" text-anchor="middle" class="th">Protection</text>
+  <text x="75" y="88" text-anchor="middle" class="ts">TPD2EUSB30 · PPTC</text></g>
+
+<!-- 5V bus segments -->
+<line x1="75" y1="96"  x2="75" y2="128" stroke="#9ca3af" stroke-width="1.5"/>
+<line x1="75" y1="165" x2="75" y2="210" stroke="#9ca3af" stroke-width="1.5"/>
+<line x1="75" y1="247" x2="75" y2="292" stroke="#9ca3af" stroke-width="1.5"/>
+<text x="81" y="118" class="tl">5 V bus</text>
+
+<g class="blue"><rect x="20" y="128" width="110" height="37" rx="4"/>
+  <text x="75" y="143" text-anchor="middle" class="th">TLV62569A</text>
+  <text x="75" y="157" text-anchor="middle" class="ts">Buck 5→3.3 V</text></g>
+
+<g class="green"><rect x="20" y="210" width="110" height="37" rx="4"/>
+  <text x="75" y="225" text-anchor="middle" class="th">TLV755P</text>
+  <text x="75" y="239" text-anchor="middle" class="ts">LDO 5→3.3 V</text></g>
+
+<g class="orange"><rect x="20" y="292" width="110" height="37" rx="4"/>
+  <text x="75" y="307" text-anchor="middle" class="th">TPS7A20</text>
+  <text x="75" y="321" text-anchor="middle" class="ts">LDO 5→3.3 V</text></g>
+
+<!-- ── 3.3V POWER ARROWS ── -->
+<line x1="130" y1="146" x2="162" y2="146" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ab)"/>
+<text x="146" y="141" text-anchor="middle" class="tl" style="fill:#3b82f6">3.3V</text>
+
+<line x1="130" y1="228" x2="162" y2="228" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ag)"/>
+<text x="146" y="223" text-anchor="middle" class="tl" style="fill:#10b981">3.3V</text>
+
+<!-- TPS7A20 → sensor group via vertical distribution bus at x=152 -->
+<line x1="130" y1="310" x2="152" y2="310" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
+<line x1="152" y1="292" x2="152" y2="462" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
+<line x1="152" y1="310" x2="162" y2="310" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
+<line x1="152" y1="355" x2="162" y2="355" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
+<line x1="152" y1="400" x2="162" y2="400" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
+<line x1="152" y1="445" x2="162" y2="445" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
+<text x="144" y="338" text-anchor="middle" class="tl" style="fill:#f97316">3.3V</text>
+
+<!-- ── CENTER COL: ESP32 + sensors (x=162 w=220 right=382) ── -->
+<g class="blue"><rect x="162" y="110" width="220" height="92" rx="4"/>
+  <text x="272" y="130" text-anchor="middle" class="th">ESP32-C3-WROOM-02</text>
+  <text x="272" y="147" text-anchor="middle" class="ts">ESPHome · Wi-Fi · OTA</text>
+  <text x="272" y="162" text-anchor="middle" class="ts">native API → Home Assistant</text>
+  <text x="272" y="177" text-anchor="middle" class="ts">SDA GPIO 7 · SCL GPIO 8</text>
+  <text x="272" y="192" text-anchor="middle" class="ts">GPIO 5: fault LED · GPIO 6: WS2812</text></g>
+
+<g class="green"><rect x="162" y="210" width="220" height="37" rx="4"/>
+  <text x="272" y="225" text-anchor="middle" class="th">SCD41</text>
+  <text x="272" y="239" text-anchor="middle" class="ts">CO₂ · temperature · humidity</text></g>
+
+<g class="orange"><rect x="162" y="292" width="220" height="37" rx="4"/>
+  <text x="272" y="307" text-anchor="middle" class="th">SGP41</text>
+  <text x="272" y="321" text-anchor="middle" class="ts">VOC index · NOx index</text></g>
+
+<g class="orange"><rect x="162" y="337" width="220" height="37" rx="4"/>
+  <text x="272" y="352" text-anchor="middle" class="th">SHT40</text>
+  <text x="272" y="366" text-anchor="middle" class="ts">temperature · humidity (ref)</text></g>
+
+<g class="orange"><rect x="162" y="382" width="220" height="37" rx="4"/>
+  <text x="272" y="397" text-anchor="middle" class="th">BMP280</text>
+  <text x="272" y="411" text-anchor="middle" class="ts">pressure · temperature</text></g>
+
+<g class="gray"><rect x="162" y="427" width="220" height="37" rx="4"/>
+  <text x="272" y="442" text-anchor="middle" class="th">QWIIC</text>
+  <text x="272" y="456" text-anchor="middle" class="ts">I2C expansion</text></g>
+
+<!-- ── I2C BUS (x=390) ── -->
+<line x1="382" y1="202" x2="390" y2="202" stroke="#6366f1" stroke-width="1.5"/>
+<line x1="390" y1="202" x2="390" y2="462" stroke="#6366f1" stroke-width="1.5"/>
+<text x="396" y="340" class="tl" style="fill:#6366f1">I2C</text>
+<text x="396" y="350" class="tl" style="fill:#6366f1">50 kHz</text>
+<line x1="390" y1="228" x2="382" y2="228" stroke="#6366f1" stroke-width="1.5" marker-end="url(#ai)"/>
+<line x1="390" y1="310" x2="382" y2="310" stroke="#6366f1" stroke-width="1.5" marker-end="url(#ai)"/>
+<line x1="390" y1="355" x2="382" y2="355" stroke="#6366f1" stroke-width="1.5" marker-end="url(#ai)"/>
+<line x1="390" y1="400" x2="382" y2="400" stroke="#6366f1" stroke-width="1.5" marker-end="url(#ai)"/>
+<line x1="390" y1="445" x2="382" y2="445" stroke="#6366f1" stroke-width="1.5" marker-end="url(#ai)"/>
+
+<!-- ── RIGHT COL: GPIO outputs (x=406) ── -->
+<line x1="382" y1="142" x2="406" y2="142" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="382" y1="175" x2="406" y2="175" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#a)"/>
+
+<g class="amber"><rect x="406" y="124" width="118" height="36" rx="4"/>
+  <text x="465" y="139" text-anchor="middle" class="th">WS2812</text>
+  <text x="465" y="152" text-anchor="middle" class="ts">RGB air quality</text></g>
+
+<g class="red"><rect x="406" y="160" width="118" height="36" rx="4"/>
+  <text x="465" y="175" text-anchor="middle" class="th">Fault LED</text>
+  <text x="465" y="188" text-anchor="middle" class="ts">sensor error</text></g>
+
+<!-- ── LEGEND ── -->
+<line x1="20"  y1="490" x2="48"  y2="490" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text x="53"  y="494" class="tl">3.3V TLV62569A</text>
+<line x1="148" y1="490" x2="176" y2="490" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text x="181" y="494" class="tl">3.3V TLV755P</text>
+<line x1="270" y1="490" x2="298" y2="490" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text x="303" y="494" class="tl">3.3V TPS7A20</text>
+<line x1="393" y1="490" x2="421" y2="490" stroke="#6366f1" stroke-width="1.5"/>
+<text x="426" y="494" class="tl">I2C / GPIO</text>
+</svg>
