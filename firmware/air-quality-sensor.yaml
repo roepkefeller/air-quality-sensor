@@ -6,6 +6,18 @@
 esphome:
   name: air-quality-sensor
   friendly_name: Air Quality Sensor
+  on_boot:
+    priority: -100
+    # Wait for all components to fully initialize before allowing any
+    # sensor-driven LED updates. This avoids a crash in the WS2812
+    # driver if it gets called before its buffer is ready.
+    # (restore_mode: RESTORE_DEFAULT_OFF on the light keeps it off
+    # at boot, so no explicit turn-off is needed.)
+    then:
+      - delay: 5s
+      - globals.set:
+          id: led_ready
+          value: 'true'
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -54,6 +66,17 @@ globals:
     type: bool
     restore_value: true
     initial_value: 'true'
+  # Persists the user's chosen brightness explicitly.
+  - id: user_brightness
+    type: float
+    restore_value: true
+    initial_value: '0.25'
+  # Becomes true 5s after boot, indicating the LED driver is initialized
+  # and safe to drive. Avoids a crash if the script fires before then.
+  - id: led_ready
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 # ---------------------------------------------------------------------------
 # I2C bus
@@ -69,15 +92,29 @@ i2c:
 # ---------------------------------------------------------------------------
 sensor:
   # --- SHT40: temperature + humidity (high accuracy) ---
+  # The SHT40 is the most accurate T/H sensor on the board, but it sits on
+  # a PCB that self-heats from the SGP41 heater (~400°C internally),
+  # ESP32-C3 with WiFi, and the regulators. Calibrate the offsets below
+  # against a trusted reference thermometer.
   - platform: sht4x
     address: 0x44
     update_interval: 30s
     temperature:
       name: "Temperature (SHT40)"
       id: sht40_temperature
+      filters:
+        # Subtract self-heating offset. Tune empirically: place a known-good
+        # thermometer next to the board, let everything stabilize for 30+
+        # minutes, and adjust this until they match.
+        - offset: -5.5
     humidity:
       name: "Humidity (SHT40)"
       id: sht40_humidity
+      filters:
+        # When the board reads ~5°C high, RH reads ~10-15% low because RH
+        # is temperature-dependent. We add back a small offset; better
+        # accuracy comes from physically separating sensors in next revision.
+        - offset: 8.0
 
   # --- BMP280: pressure + temperature ---
   - platform: bmp280_i2c
@@ -86,18 +123,22 @@ sensor:
     temperature:
       name: "Temperature (BMP280)"
       oversampling: 16x
+      filters:
+        - offset: -5.5
     pressure:
       name: "Pressure"
       id: bmp280_pressure
 
   # --- SCD41: CO2, temperature, humidity ---
-  # Kept in config in case it starts working. If it stays silent, the
-  # fault LED indicates this and VOC becomes the fallback air-quality signal.
   - platform: scd4x
     id: scd41_sensor
     address: 0x62
     update_interval: 30s
     measurement_mode: periodic
+    # Keep the chip's internal offset at default (4°C). Additional
+    # compensation for board self-heating is applied via filter offsets
+    # on the individual sensor outputs below, matching how SHT40 and
+    # BMP280 handle it.
     ambient_pressure_compensation_source: bmp280_pressure
     co2:
       name: "CO2"
@@ -107,8 +148,15 @@ sensor:
           - script.execute: update_air_quality_led
     temperature:
       name: "Temperature (SCD41)"
+      filters:
+        # Adjusts for additional board self-heating beyond what the chip's
+        # own 4°C internal offset compensates for. Tune to match SHT40.
+        - offset: -1.5
     humidity:
       name: "Humidity (SCD41)"
+      filters:
+        # Higher temp reading on the SCD41 also caused humidity to read low.
+        - offset: 4.0
 
   # --- SGP41: VOC + NOx index (with humidity compensation from SHT40) ---
   - platform: sgp4x
@@ -143,14 +191,17 @@ light:
     num_leds: 1
     rgb_order: GRB
     chipset: WS2812
-    default_transition_length: 500ms
     restore_mode: RESTORE_DEFAULT_OFF
-    # Track the user's last on/off intent so we can persist it across reboots
-    # and across sensor-update color changes.
     on_turn_on:
       - globals.set:
           id: user_wants_led_on
           value: 'true'
+      # Capture brightness on each turn-on. HA's brightness slider sends
+      # a turn_on with the new brightness, so this also captures slider
+      # changes while the LED is already on.
+      - lambda: |-
+          float b = id(air_quality_led).remote_values.get_brightness();
+          if (b > 0.0f && b <= 1.0f) id(user_brightness) = b;
     on_turn_off:
       - globals.set:
           id: user_wants_led_on
@@ -201,18 +252,23 @@ script:
   - id: update_air_quality_led
     then:
       - lambda: |-
-          // Read current LED state for brightness.
-          auto current = id(air_quality_led).remote_values;
-          float brightness = current.get_brightness();
+          // Don't touch the LED until 5s after boot — the WS2812 driver
+          // can crash if poked before its internal buffer is initialized.
+          if (!id(led_ready)) return;
 
-          // On first boot ever, default to 25% brightness. After that,
-          // whatever the user sets in HA persists.
-          if (!id(brightness_initialized)) {
+          float brightness = id(user_brightness);
+
+          // First-boot safety: if somehow brightness is invalid, use 25%.
+          if (brightness <= 0.0f || brightness > 1.0f) {
             brightness = 0.25f;
+            id(user_brightness) = brightness;
+          }
+
+          if (!id(brightness_initialized)) {
             id(brightness_initialized) = true;
           }
 
-          // Decide the target color based on sensor data.
+          // Decide target color from sensor data.
           float r = 0.0f, g = 0.0f, b = 0.0f;
           bool have_color = false;
 
@@ -232,20 +288,15 @@ script:
 
           if (!have_color) return;
 
-          // Respect the user's persistent on/off choice. If they turned
-          // it off in HA, we still update the color "next time", but we
-          // don't turn it on.
           bool should_be_on = id(user_wants_led_on);
 
           if (should_be_on) {
             auto call = id(air_quality_led).turn_on();
             call.set_rgb(r, g, b);
             call.set_brightness(brightness);
-            call.set_transition_length(500);
+            call.set_transition_length(0);
             call.perform();
           } else {
-            // LED is off by user choice — make sure it stays off, but
-            // queue up the correct color for when they turn it back on.
             auto call = id(air_quality_led).turn_off();
             call.set_rgb(r, g, b);
             call.set_brightness(brightness);

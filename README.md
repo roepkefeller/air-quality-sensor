@@ -1,6 +1,6 @@
 # Air Quality Sensor
 
-A DIY open-source air quality monitor built around an ESP32-C3, featuring a custom 4-layer PCB with four Sensirion/Bosch sensors, a laser-cut glass top panel, and a 3D-printed holder. Firmware runs on [ESPHome](https://esphome.io) and integrates natively with Home Assistant.
+A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https://documentation.espressif.com/esp32-c3-wroom-02_datasheet_en.pdf), featuring a custom 4-layer PCB with four Sensirion/Bosch sensors, a laser-cut glass top panel, and a 3D-printed holder. Firmware runs on [ESPHome](https://esphome.io) and integrates natively with Home Assistant.
 
 ![Fusion 360 render](docs/images/air_quality_sensor_fusion360-render.png)
 
@@ -31,12 +31,12 @@ A DIY open-source air quality monitor built around an ESP32-C3, featuring a cust
 
 ## What it measures
 
-| Sensor | Measurements | Notes |
-|--------|-------------|-------|
-| **Sensirion SCD41** | CO₂ (ppm), temperature, humidity | Primary air quality signal |
-| **Sensirion SGP41** | VOC Index (1–500), NOx Index (1–500) | Fallback if SCD41 unavailable |
-| **Sensirion SHT40** | Temperature (±0.2 °C), humidity (±1.8 %RH) | Reference for sensor compensation |
-| **Bosch BMP280** | Barometric pressure, temperature | CO₂ altitude compensation source |
+| Sensor | Measurements | Notes | Datasheet |
+|--------|-------------|-------|-----------|
+| **Sensirion SCD41** | CO₂ (ppm), temperature, humidity | Primary air quality signal | [PDF](https://sensirion.com/media/documents/48C4B7FB/67FE0194/CD_DS_SCD4x_Datasheet_D1.pdf) |
+| **Sensirion SGP41** | VOC Index (1–500), NOx Index (1–500) | Fallback if SCD41 unavailable | [PDF](https://sensirion.com/media/documents/5FE8673C/61E96F50/Sensirion_Gas_Sensors_Datasheet_SGP41.pdf) |
+| **Sensirion SHT40** | Temperature (±0.2 °C), humidity (±1.8 %RH) | Reference for sensor compensation | [PDF](https://sensirion.com/resource/datasheet/sht4x) |
+| **Bosch BMP280** | Barometric pressure, temperature | CO₂ altitude compensation source | [PDF](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp280-ds001.pdf) |
 
 ---
 
@@ -64,9 +64,11 @@ The SGP41 uses a metal oxide (MOX) sensing element to detect volatile organic co
 
 The SHT40 is the most accurate temperature and humidity sensor on the board. Its readings feed the SGP41's built-in compensation algorithm, which requires accurate ambient conditions to produce reliable VOC and NOx readings. The SHT40 is also the primary source of temperature and humidity data for the Home Assistant dashboard — the SCD41 and BMP280 both have internal temperature sensors, but they run warmer due to self-heating and are less accurate.
 
+All sensors on this board are affected by self-heating from the SGP41's MOX element (which runs an internal heater at ~400 °C), the ESP32-C3 Wi-Fi radio, and the power regulators. The firmware applies empirically calibrated offset corrections: −5.5 °C / +8 %RH for the SHT40, −5.5 °C for the BMP280, and −1.5 °C / +4 %RH for the SCD41. These values may need tuning — place a known-good reference thermometer next to the board, let everything stabilize for 30+ minutes, and adjust the offsets in the YAML until they match.
+
 **BMP280 — Barometric pressure**
 
-The BMP280 adds barometric pressure, which has two uses: it feeds the SCD41's ambient pressure compensation input (NDIR CO₂ sensors read differently at different altitudes), and it provides weather-correlation data for the Home Assistant dashboard. A secondary temperature reading from the BMP280 is also useful for estimating board self-heating effects.
+The BMP280 adds barometric pressure, which has two uses: it feeds the SCD41's ambient pressure compensation input (NDIR CO₂ sensors read differently at different altitudes), and it provides weather-correlation data for the Home Assistant dashboard.
 
 ---
 
@@ -80,9 +82,9 @@ The power path is:
 
 Three regulators run in parallel off the 5 V bus, each feeding a dedicated load:
 
-- **TLV62569A** (synchronous buck converter) → ESP32-C3. The buck is efficient for the ESP32's variable current draw but produces switching noise, so it feeds only the microcontroller, not the sensors.
-- **TLV755P** (LDO) → SCD41. The SCD41's photoacoustic CO₂ measurement is sensitive to supply noise; a dedicated LDO with a higher current rating than the TPS7A20 keeps its rail clean and isolated.
-- **TPS7A20** (ultra-low-noise LDO, 10 µVRMS) → SGP41, SHT40, BMP280, and the QWIIC connector. The SGP41's MOX element and SHT40's capacitive humidity sensor are especially susceptible to supply noise; the TPS7A20 keeps all three on a single clean rail, isolated from both the buck and the SCD41's LDO.
+- **[TLV62569A](https://www.ti.com/lit/ds/symlink/tlv62569a.pdf)** (synchronous buck converter) → ESP32-C3. The buck is efficient for the ESP32's variable current draw but produces switching noise, so it feeds only the microcontroller, not the sensors.
+- **[TLV755P](https://www.ti.com/lit/ds/symlink/tlv755p.pdf)** (LDO) → SCD41. The SCD41's photoacoustic CO₂ measurement is sensitive to supply noise; a dedicated LDO with a higher current rating than the TPS7A20 keeps its rail clean and isolated.
+- **[TPS7A20](https://www.ti.com/lit/ds/symlink/tps7a20.pdf)** (ultra-low-noise LDO, 10 µVRMS) → SGP41, SHT40, BMP280, and the QWIIC connector. The SGP41's MOX element and SHT40's capacitive humidity sensor are especially susceptible to supply noise; the TPS7A20 keeps all three on a single clean rail, isolated from both the buck and the SCD41's LDO.
 
 The **PPTC fuse** is a self-resetting polyfuse rated at 750 mA, protecting the board against overcurrent faults without requiring manual intervention.
 
@@ -101,8 +103,16 @@ The **PPTC fuse** is a self-resetting polyfuse rated at 750 mA, protecting the b
   </tr>
 </table>
 
-![Assembled PCB rev 1](docs/images/pcb-assembled.jpg)
-<!-- TODO: add photo of assembled rev 1 board -->
+<table>
+  <tr>
+    <td><img src="docs/images/pcb-esp32-side.jpg" alt="PCB component side — ESP32 and sensors"/></td>
+    <td><img src="docs/images/pcb-sensor-side.jpg" alt="PCB bottom side — silkscreen"/></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Component side — ESP32, SCD41, regulators</em></td>
+    <td align="center"><em>Bottom side — silkscreen</em></td>
+  </tr>
+</table>
 
 The PCB is a 4-layer board designed in [KiCad](https://www.kicad.org/). Bare boards were manufactured by [JLCPCB](https://jlcpcb.com/) and assembled by hand.
 
@@ -115,7 +125,6 @@ The board uses a mix of 0402 and 0603 passives, with all ICs in small SMD packag
 ### Enclosure
 
 ![Full unit assembled](docs/images/unit-assembled.jpg)
-<!-- TODO: add photo of fully assembled unit (PCB + holder + glass top) -->
 
 The enclosure consists of three parts:
 
@@ -123,9 +132,11 @@ The enclosure consists of three parts:
 
 **Laser-cut glass top** (`hardware/enclosure/air_quality_sensor_glass_top.dxf`, `.step`, `.f3d`): 2 mm clear glass, sourced from [Formulor](https://www.formulor.de) using the provided DXF file.
 
-**Standoffs**: M2.5 × 10 mm male-female hex standoffs (5 mm across flats) mount between the PCB and the glass top. The Fusion 360 model is included at `hardware/enclosure/Standoff mf - M2.5 x 10 across flats 5mm.f3d`.
+**Standoffs**: [M2.5 × 10 mm male-female hex standoffs](https://www.amazon.de/dp/B0C1FY87PY) (5 mm across flats) mount between the PCB and the glass top. The Fusion 360 model is included at `hardware/enclosure/Standoff mf - M2.5 x 10 across flats 5mm.f3d`.
 
-**Power supply and cable**: any USB-C power supply providing 5 V/1 A or more. A USB-C cable is required — USB-C to USB-A adapters also work with a suitable charger. Photo to be added once a suitable setup is sourced.
+**Heated inserts**: [M2.5 heat-set inserts](https://www.amazon.de/dp/B0F2TGGBMC) are pressed into the 3D-printed holder with a soldering iron before screwing in the standoffs. This gives the plastic threads much better durability than screwing directly into printed material.
+
+**Power supply and cable**: 5 V/1 A USB-A wall charger + USB-C to USB-A cable. Any charger rated ≥1 A works. Tested with: [RAVIAD USB-C Kabel 1 m (€3.99)](https://www.amazon.de/gp/product/B0GT379MW7) and [18W USB-A Ladegerät, 4er-Pack (€19.98)](https://www.amazon.de/gp/product/B0CRS1YX4S).
 <!-- TODO: add photo of USB-C cable + power supply -->
 
 ---
@@ -223,6 +234,10 @@ The WS2812 RGB LED on the board gives an at-a-glance air quality reading. The fi
 | 🟡 Yellow | 800–1200 ppm | 150–250 |
 | 🔴 Red | > 1200 ppm | > 250 |
 
+Brightness defaults to 25% on first boot and is then fully user-controlled from Home Assistant. The chosen brightness persists across reboots. The LED can also be turned on/off from HA — the on/off state persists independently of brightness. Color updates are intentionally instant (no transition fade) so the reading snaps to the new value as soon as a sensor reports.
+
+The LED driver is activated 5 seconds after boot to avoid a crash in the WS2812 driver before its internal buffer is initialized. During this window the LED stays off regardless of sensor data.
+
 A second red LED (the fault LED) lights up whenever any sensor stops reporting valid data. It re-evaluates every 30 seconds as a backstop against sensors going silently missing.
 
 ---
@@ -230,6 +245,8 @@ A second red LED (the fault LED) lights up whenever any sensor stops reporting v
 ### Web interface
 
 The device runs a built-in web server on port 80. Navigate to `http://air-quality-sensor.local` (or the device's IP) in any browser on the same network to see all sensor readings and control buttons without Home Assistant.
+
+![Web interface](docs/images/web-interface.png)
 
 Diagnostic buttons available in the web UI and in Home Assistant:
 
