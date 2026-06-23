@@ -12047,7 +12047,7 @@
 				(justify right)
 			)
 		)
-		(property "Value" "100n/10V/X5R"
+		(property "Value" "1µ/10V/X5R"
 			(at 151.892 140.97 0)
 			(show_name no)
 			(do_not_autoplace no)
