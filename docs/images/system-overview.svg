@@ -1,6 +1,6 @@
 <svg width="100%" viewBox="0 0 680 510" role="img" xmlns="http://www.w3.org/2000/svg">
 <title>Air Quality Sensor — system overview</title>
-<desc>Three-rail power architecture: TLV62569A to ESP32, TLV755P to SCD41, TPS7A20 to SGP41/SHT40/BMP280/QWIIC. All sensors share a 50 kHz I2C bus. ESP32 drives WS2812 RGB LED and fault LED via GPIO.</desc>
+<desc>Three-rail power architecture: TLV62569A to ESP32 and QWIIC, TLV755P to SCD41, TPS7A20 to SGP41/SHT40/BMP280. All sensors share a 50 kHz I2C bus. ESP32 drives WS2812 RGB LED and fault LED via GPIO.</desc>
 <defs>
 <style>
   text { font-family: sans-serif; fill: #1a1a1a; }
@@ -71,12 +71,15 @@
 
 <!-- TPS7A20 → sensor group via vertical distribution bus at x=152 -->
 <line x1="130" y1="310" x2="152" y2="310" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
-<line x1="152" y1="292" x2="152" y2="462" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
+<line x1="152" y1="292" x2="152" y2="420" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2"/>
 <line x1="152" y1="310" x2="162" y2="310" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
 <line x1="152" y1="355" x2="162" y2="355" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
 <line x1="152" y1="400" x2="162" y2="400" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
-<line x1="152" y1="445" x2="162" y2="445" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ao)"/>
-<text x="144" y="338" text-anchor="middle" class="tl" style="fill:#f97316">3.3V</text>
+<text x="158" y="338" text-anchor="middle" class="tl" style="fill:#f97316">3.3V</text>
+
+<!-- TLV62569A also powers QWIIC via vertical blue bus at x=138 -->
+<line x1="138" y1="146" x2="138" y2="445" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4 2"/>
+<line x1="138" y1="445" x2="162" y2="445" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#ab)"/>
 
 <!-- ── CENTER COL: ESP32 + sensors (x=162 w=220 right=382) ── -->
 <g class="blue"><rect x="162" y="110" width="220" height="92" rx="4"/>

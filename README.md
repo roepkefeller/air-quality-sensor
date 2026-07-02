@@ -82,9 +82,9 @@ The power path is:
 
 Three regulators run in parallel off the 5 V bus, each feeding a dedicated load:
 
-- **[TLV62569A](https://www.ti.com/lit/ds/symlink/tlv62569a.pdf)** (synchronous buck converter) → ESP32-C3. The buck is efficient for the ESP32's variable current draw but produces switching noise, so it feeds only the microcontroller, not the sensors.
+- **[TLV62569A](https://www.ti.com/lit/ds/symlink/tlv62569a.pdf)** (synchronous buck converter) → ESP32-C3 and QWIIC connector. The buck is efficient for the ESP32's variable current draw. The QWIIC connector shares this rail, keeping the sensitive sensor LDO rails free from expansion board loads.
 - **[TLV755P](https://www.ti.com/lit/ds/symlink/tlv755p.pdf)** (LDO) → SCD41. The SCD41's photoacoustic CO₂ measurement is sensitive to supply noise; a dedicated LDO with a higher current rating than the TPS7A20 keeps its rail clean and isolated.
-- **[TPS7A20](https://www.ti.com/lit/ds/symlink/tps7a20.pdf)** (ultra-low-noise LDO, 10 µVRMS) → SGP41, SHT40, BMP280, and the QWIIC connector. The SGP41's MOX element and SHT40's capacitive humidity sensor are especially susceptible to supply noise; the TPS7A20 keeps all three on a single clean rail, isolated from both the buck and the SCD41's LDO.
+- **[TPS7A20](https://www.ti.com/lit/ds/symlink/tps7a20.pdf)** (ultra-low-noise LDO, 10 µVRMS) → SGP41, SHT40, and BMP280. The SGP41's MOX element and SHT40's capacitive humidity sensor are especially susceptible to supply noise; the TPS7A20 keeps all three on a single clean rail, isolated from both the buck and the SCD41's LDO.
 
 The **PPTC fuse** is a self-resetting polyfuse rated at 750 mA, protecting the board against overcurrent faults without requiring manual intervention.
 
