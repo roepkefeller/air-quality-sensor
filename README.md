@@ -22,6 +22,7 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
 - [Firmware](#firmware)
   - [Getting started](#getting-started)
   - [LED behavior](#led-behavior)
+  - [Home Assistant entities](#home-assistant-entities)
   - [Web interface](#web-interface)
   - [Diagnostic configs](#diagnostic-configs)
 - [Manufacturing](#manufacturing)
@@ -34,7 +35,7 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
 | Sensor | Measurements | Notes | Datasheet |
 |--------|-------------|-------|-----------|
 | **Sensirion SCD41** | CO₂ (ppm), temperature, humidity | Primary air quality signal | [PDF](https://sensirion.com/media/documents/48C4B7FB/67FE0194/CD_DS_SCD4x_Datasheet_D1.pdf) |
-| **Sensirion SGP41** | VOC Index (1–500), NOx Index (1–500) | Fallback if SCD41 unavailable | [PDF](https://sensirion.com/media/documents/5FE8673C/61E96F50/Sensirion_Gas_Sensors_Datasheet_SGP41.pdf) |
+| **Sensirion SGP41** | VOC Index (1–500), NOx Index (1–500) | Always active; LED falls back to VOC if CO₂ unavailable | [PDF](https://sensirion.com/media/documents/5FE8673C/61E96F50/Sensirion_Gas_Sensors_Datasheet_SGP41.pdf) |
 | **Sensirion SHT40** | Temperature (±0.2 °C), humidity (±1.8 %RH) | Reference for sensor compensation | [PDF](https://sensirion.com/resource/datasheet/sht4x) |
 | **Bosch BMP280** | Barometric pressure, temperature | CO₂ altitude compensation source | [PDF](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp280-ds001.pdf) |
 
@@ -44,7 +45,7 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
 
 ![System overview diagram](docs/images/system-overview.svg)
 
-The ESP32-C3 sits at the center of the design. All four sensors share a single I2C bus running at 50 kHz. The BMP280 pressure reading feeds the SCD41's ambient pressure compensation input, and the SHT40 temperature and humidity readings feed the SGP41's gas compensation algorithm. This cross-sensor compensation is why all four sensors are present even though some measurements overlap.
+The ESP32-C3 sits at the center of the design. All four sensors share a single I2C bus running at 50 kHz. The BMP280 pressure reading feeds the SCD41's ambient pressure compensation input. The firmware consolidates the three redundant temperature sensors and two humidity sensors into single median-based values, which in turn feed the SGP41's gas compensation algorithm. This cross-sensor compensation is why all four sensors are present even though some measurements overlap.
 
 ---
 
@@ -62,7 +63,7 @@ The SGP41 uses a metal oxide (MOX) sensing element to detect volatile organic co
 
 **SHT40 — Temperature and humidity (reference)**
 
-The SHT40 is the most accurate temperature and humidity sensor on the board. Its readings feed the SGP41's built-in compensation algorithm, which requires accurate ambient conditions to produce reliable VOC and NOx readings. The SHT40 is also the primary source of temperature and humidity data for the Home Assistant dashboard — the SCD41 and BMP280 both have internal temperature sensors, but they run warmer due to self-heating and are less accurate.
+The SHT40 is the most accurate temperature and humidity sensor on the board, and it carries double weight in the firmware's median-based sensor fusion. The consolidated Temperature and Humidity entities shown in Home Assistant draw on all available sensors but are dominated by the SHT40 when it agrees with the others. The SCD41 and BMP280 also have internal temperature sensors, but they run warmer due to self-heating and contribute as secondary inputs.
 
 All sensors on this board are affected by self-heating from the SGP41's MOX element (which runs an internal heater at ~400 °C), the ESP32-C3 Wi-Fi radio, and the power regulators. The firmware applies empirically calibrated offset corrections: −5.5 °C / +8 %RH for the SHT40, −5.5 °C for the BMP280, and −1.5 °C / +4 %RH for the SCD41. These values may need tuning — place a known-good reference thermometer next to the board, let everything stabilize for 30+ minutes, and adjust the offsets in the YAML until they match.
 
@@ -137,7 +138,6 @@ The enclosure consists of three parts:
 **Heated inserts**: [M2.5 heat-set inserts](https://www.amazon.de/dp/B0F2TGGBMC) are pressed into the 3D-printed holder with a soldering iron before screwing in the standoffs. This gives the plastic threads much better durability than screwing directly into printed material.
 
 **Power supply and cable**: 5 V/1 A USB-A wall charger + USB-C to USB-A cable. Any charger rated ≥1 A works. Tested with: [RAVIAD USB-C Kabel 1 m (€3.99)](https://www.amazon.de/gp/product/B0GT379MW7) and [18W USB-A Ladegerät, 4er-Pack (€19.98)](https://www.amazon.de/gp/product/B0CRS1YX4S).
-<!-- TODO: add photo of USB-C cable + power supply -->
 
 ---
 
@@ -147,7 +147,7 @@ The enclosure consists of three parts:
 
 All components are SMD. The board was assembled by hand with a soldering iron, flux, and solder paste on the fine-pitch ICs.
 
-Recommended soldering order — smallest and most heat-sensitive first, connectors last:
+Recommended soldering order — ICs and sensor packages before passives, connectors last:
 
 1. **ESP32-C3-WROOM-02** — the largest IC; solder the pads around the perimeter, then reflow the exposed pad underneath with a hot-air station or by heating the board from below.
 2. **TLV62569A, TLV755P, TPS7A20, TPD2EUSB30** — small SOT/WSON packages; drag-solder or use solder paste + hot air.
@@ -211,16 +211,27 @@ The firmware is a single [ESPHome](https://esphome.io) YAML configuration. ESPHo
 
    The `ota_password` can be any string — you'll be prompted for it when pushing firmware updates over the air.
 
-2. Flash via USB (first time):
+2. Flash via USB using the included wrapper script:
 
    ```bash
    cd firmware
-   esphome run air-quality-sensor.yaml
+   ./flash.sh Wohnzimmer                        # first flash: interactive port selection
+   ./flash.sh Kueche --device 192.168.178.132   # target a known IP for OTA
+   ```
+
+   The `location` argument (e.g. `Wohnzimmer`, `Kueche`) is stamped into the device's friendly name in Home Assistant, so multiple boards are distinguishable. The script also derives the firmware version from git — the current tag if HEAD is tagged, otherwise `dev-YYYY-MM-DD`, with `-dirty` appended if there are uncommitted changes.
+
+   For manual invocation without the wrapper:
+
+   ```bash
+   esphome -s location "Wohnzimmer" -s firmware_version "dev-manual" run air-quality-sensor.yaml
    ```
 
 3. All subsequent updates are over-the-air automatically.
 
-**Home Assistant:** once on the network the device is auto-discovered via the native API. Go to Settings → Integrations and accept the discovered device. All sensors, the fault indicator, and the LED control appear as entities immediately.
+**Multiple boards:** the firmware is designed to be shared across boards unchanged. `name_add_mac_suffix: true` appends the last 3 bytes of each board's WiFi MAC to its hostname (e.g. `air-quality-sensor-a1b2c3.local`), so boards don't conflict on the network. Only the `location` substitution at flash time differs.
+
+**Home Assistant:** once on the network the device is auto-discovered via the native API. Go to Settings → Integrations and accept the discovered device. All entities appear immediately.
 
 ---
 
@@ -234,6 +245,10 @@ The WS2812 RGB LED on the board gives an at-a-glance air quality reading. The fi
 | 🟡 Yellow | 800–1200 ppm | 150–250 |
 | 🔴 Red | > 1200 ppm | > 250 |
 
+All three thresholds (green→yellow, yellow→red, and a separate pulse threshold) are exposed as configurable Number entities in Home Assistant — no reflash needed to tune them. The defaults above apply on first boot.
+
+Above the pulse threshold (default 1500 ppm CO₂ / 350 VOC), the LED switches from solid to a slow pulse (30–80% brightness, 1 s cycle) to draw attention to critically poor air quality.
+
 Brightness defaults to 25% on first boot and is then fully user-controlled from Home Assistant. The chosen brightness persists across reboots. The LED can also be turned on/off from HA — the on/off state persists independently of brightness. Color updates are intentionally instant (no transition fade) so the reading snaps to the new value as soon as a sensor reports.
 
 The LED driver is activated 5 seconds after boot to avoid a crash in the WS2812 driver before its internal buffer is initialized. During this window the LED stays off regardless of sensor data.
@@ -242,9 +257,48 @@ A second red LED (the fault LED) lights up whenever any sensor stops reporting v
 
 ---
 
+### Home Assistant entities
+
+The device exposes a rich set of entities organized into three tiers in the HA device page:
+
+**Primary (visible on the main card)**
+
+| Entity | Description |
+|--------|-------------|
+| Temperature | Consolidated from SHT40, BMP280, SCD41 via median + outlier rejection (SHT40 weighted 2×) |
+| Humidity | Consolidated from SHT40 and SCD41; SHT40 preferred if they disagree by > 10 %RH |
+| CO₂ | Raw SCD41 reading with ambient pressure compensation from BMP280 |
+| VOC Index | SGP41 MOX index (1–500, baseline 100), compensated with consolidated T/H |
+| NOx Index | SGP41 NOx index (1–500) |
+| Pressure | BMP280 barometric pressure |
+| Absolute Humidity | Computed from consolidated T/H via Magnus–Tetens formula (g/m³) |
+| Dew Point | Computed from consolidated T/H via Magnus formula (°C) |
+| Air Quality Score | Weighted composite: CO₂ 40%, VOC 25%, NOx 15%, temperature comfort 10%, humidity comfort 10% (0–100%) |
+| Comfort Zone | ASHRAE-inspired classification: Comfortable / Acceptable / Too cold / Too hot / Too dry / Too humid |
+| Air Quality LED | RGB light entity — color and pulse controlled by firmware, brightness/on-off by user |
+| Sensor Fault | Binary problem sensor — on if any sensor stops publishing |
+
+**Controls**
+
+| Entity | Description |
+|--------|-------------|
+| Boost Mode | Switch — reduces all sensor update intervals from 30 s to 5 s for fast feedback (e.g. while cooking) |
+| Threshold CO₂ Green→Yellow | Configurable ppm threshold (default 800) |
+| Threshold CO₂ Yellow→Red | Configurable ppm threshold (default 1200) |
+| Threshold CO₂ Pulse (Critical) | Triggers pulse effect above this level (default 1500 ppm) |
+| Threshold VOC Green→Yellow | Configurable VOC index (default 150) |
+| Threshold VOC Yellow→Red | Configurable VOC index (default 250) |
+| Threshold VOC Pulse (Critical) | Triggers pulse effect above this level (default 350) |
+
+**Diagnostics** (collapsed by default in HA)
+
+Per-sensor raw values (Temperature SHT40/BMP280/SCD41, Humidity SHT40/SCD41), per-sensor health (0/100%), peak CO₂/VOC/NOx/temperature/humidity since boot, time spent in each air quality category today (minutes), 5V rail voltage, uptime, reboot count, firmware version, temperature/humidity source attribution with drift annotation, last crash reason.
+
+---
+
 ### Web interface
 
-The device runs a built-in web server on port 80. Navigate to `http://air-quality-sensor.local` (or the device's IP) in any browser on the same network to see all sensor readings and control buttons without Home Assistant.
+The device runs a built-in web server on port 80. Because `name_add_mac_suffix` is enabled, the hostname includes the board's MAC suffix — navigate to `http://air-quality-sensor-XXXXXX.local` (the exact hostname is printed in the ESPHome boot log) or use the device's IP address directly. Any browser on the same network works.
 
 ![Web interface](docs/images/web-interface.png)
 
@@ -252,8 +306,9 @@ Diagnostic buttons available in the web UI and in Home Assistant:
 
 | Button | Effect |
 |--------|--------|
-| **SCD41 Factory Reset** | Clears the SCD41's calibration history and restarts the ESP32. Use if the CO₂ readings look wrong after a long transport or storage period. |
 | **Test Fault LED** | Turns the fault LED on for 2 seconds — useful for confirming the LED is soldered and working. |
+| **SCD41 Factory Reset** | Clears the SCD41's calibration history and restarts the ESP32. Use if CO₂ readings look wrong after long transport or storage. |
+| **Reset Peak Values** | Resets all peak observations (CO₂, VOC, NOx, temperature, humidity) back to their initial sentinels, so the next reading establishes a new peak. |
 | **Restart ESP** | Reboots the ESP32. |
 
 If the device cannot reach your Wi-Fi network it falls back to an access point: SSID `Air-Quality Fallback`, password `configureme`. Connect to it and navigate to `http://192.168.4.1` to reconfigure.
@@ -289,7 +344,7 @@ PCB production files are in `hardware/pcb/air_quality_sensor/jlcpcb/`:
 
 Order the bare PCB from JLCPCB using the Gerber zip. Source components separately (Mouser, LCSC, DigiKey) using the BOM, then assemble by hand — see the [Assembly](#assembly) section above for the recommended process.
 
-The schematic PDF (`hardware/pcb/air_quality_sensor/air_quality_sensor-schematic.pdf`) and interactive BOM (`bom/ibom.html`) are the primary references during assembly.
+The schematic PDF (`hardware/pcb/air_quality_sensor/air_quality_sensor-schematic.pdf`) and interactive BOM (`hardware/pcb/air_quality_sensor/bom/ibom.html`) are the primary references during assembly.
 
 ---
 

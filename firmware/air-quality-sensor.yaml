@@ -1,30 +1,124 @@
-# ESPHome configuration for custom air quality PCB
-# Board: ESP32-C3
-# Sensors: BMP280, SCD41, SGP41, SHT40 (all I2C)
-# Indicators: WS2812 RGB LED (air quality), standard LED (fault)
+# ============================================================================
+# Air Quality Sensor — ESPHome Firmware
+# ============================================================================
+#
+# Custom PCB with four Sensirion sensors (SCD41, SGP41, SHT40, BMP280) and
+# two indicator LEDs, running on ESP32-C3. Publishes to Home Assistant via
+# the native ESPHome API.
+#
+# ----------------------------------------------------------------------------
+# What this firmware does
+# ----------------------------------------------------------------------------
+#
+# * Reads CO2, VOC, NOx, temperature, humidity, and barometric pressure.
+# * Cross-compensates sensors: BMP280 pressure feeds SCD41 ambient pressure
+#   compensation; consolidated T/H feeds SGP41 gas index compensation.
+# * Consolidates the three redundant temperature sensors (SHT40, BMP280,
+#   SCD41) and the two humidity sensors (SHT40, SCD41) into single "main"
+#   entities using median-based outlier rejection, so a drifting or dead
+#   sensor doesn't silently corrupt the reading.
+# * Drives an addressable RGB LED with air quality color (green/yellow/red
+#   based on CO2, VOC fallback if CO2 is unavailable). Pulses above a
+#   configurable critical threshold.
+# * Drives a discrete "fault" LED when any sensor stops publishing.
+# * Publishes rich diagnostics (peak values, uptime, reboots, per-sensor
+#   health, 5V rail voltage) into a separate Diagnostic section in HA.
+# * Supports a "boost mode" switch that reduces update intervals to 5s for
+#   fast feedback while cooking, then reverts to 30s.
+# * All CO2/VOC color thresholds are exposed as configurable Number entities
+#   in HA — no reflash needed to tune.
+#
+# ----------------------------------------------------------------------------
+# How to flash
+# ----------------------------------------------------------------------------
+#
+# The included `flash.sh` script is the intended entry point. It derives
+# the firmware version from git (release tag if HEAD is tagged, else
+# `dev-YYYY-MM-DD`, plus `-dirty` if there are uncommitted changes) and
+# passes it to ESPHome as a substitution.
+#
+#   ./flash.sh Wohnzimmer                          # first flash: interactive
+#   ./flash.sh Kueche --device 192.168.178.132     # target a known IP
+#
+# Multiple boards can share this exact firmware file: the `location`
+# substitution differentiates them in Home Assistant, and
+# `name_add_mac_suffix` gives each board a unique network hostname
+# (e.g. `air-quality-sensor-a1b2c3.local`).
+#
+# For manual invocation without the wrapper:
+#
+#   esphome -s location "Wohnzimmer" \
+#           -s firmware_version "dev-manual" \
+#           run air-quality-sensor.yaml
+#
+# ----------------------------------------------------------------------------
+# Hardware wiring reference
+# ----------------------------------------------------------------------------
+#
+#   I2C bus       SDA = GPIO7, SCL = GPIO8, 50 kHz
+#     0x44        SHT40 (temperature + humidity)
+#     0x59        SGP41 (VOC + NOx index)
+#     0x62        SCD41 (CO2)
+#     0x76        BMP280 (pressure + temperature)
+#   WS2812 LED    GPIO6 (air quality indicator)
+#   Fault LED     GPIO5 (single-color fault indicator)
+#   5V ADC        GPIO3 (10k/10k divider tap for USB rail monitoring)
+#
+# ============================================================================
 
+
+# ----------------------------------------------------------------------------
+# Substitutions
+# ----------------------------------------------------------------------------
+# `location` differentiates devices sharing this firmware in Home Assistant.
+# `firmware_version` is stamped by the flash.sh wrapper from git state; the
+# "dev" default only appears if someone runs `esphome run` directly.
+substitutions:
+  location: "Default"
+  firmware_version: "dev"
+
+
+# ----------------------------------------------------------------------------
+# Device identity + boot behavior
+# ----------------------------------------------------------------------------
+# `name_add_mac_suffix: true` appends the last 3 bytes of the WiFi MAC to
+# the base name, so each board gets a unique hostname without per-board
+# YAML edits.
+#
+# The 5-second boot delay before setting `led_ready = true` is critical:
+# the WS2812 driver crashes if we write to it while its RMT buffer is
+# still initializing, and SCD41/SGP41 need uncontested I2C bus access
+# during their setup phase. All background work that could touch either
+# is gated on `led_ready`.
 esphome:
   name: air-quality-sensor
-  friendly_name: Air Quality Sensor
+  friendly_name: "Air Quality Sensor ${location}"
+  name_add_mac_suffix: true
   on_boot:
     priority: -100
-    # Wait for all components to fully initialize before allowing any
-    # sensor-driven LED updates. This avoids a crash in the WS2812
-    # driver if it gets called before its buffer is ready.
-    # (restore_mode: RESTORE_DEFAULT_OFF on the light keeps it off
-    # at boot, so no explicit turn-off is needed.)
     then:
       - delay: 5s
       - globals.set:
           id: led_ready
           value: 'true'
+      - lambda: 'id(reboot_count) += 1;'
 
+
+# ----------------------------------------------------------------------------
+# Platform
+# ----------------------------------------------------------------------------
+# ESP-IDF framework (not Arduino) — smaller binary, more predictable timing,
+# and required for the low-jitter WS2812 RMT driver on ESP32-C3.
 esp32:
   board: esp32-c3-devkitm-1
   variant: ESP32C3
   framework:
     type: esp-idf
 
+
+# ----------------------------------------------------------------------------
+# Connectivity
+# ----------------------------------------------------------------------------
 logger:
   level: DEBUG
 
@@ -39,6 +133,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Fallback captive-portal AP if WiFi is unreachable.
   ap:
     ssid: "Air-Quality Fallback"
     password: "configureme"
@@ -48,80 +143,313 @@ captive_portal:
 web_server:
   port: 80
 
-# ---------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Time
+# ----------------------------------------------------------------------------
+# NTP is needed for the daily counter reset at midnight. Everything else
+# runs off the monotonic uptime, so brief NTP outages don't affect
+# measurements.
+time:
+  - platform: sntp
+    id: sntp_time
+    on_time:
+      # Reset the "time spent in each air quality category today" counters
+      # at midnight local time.
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - globals.set: { id: time_green,  value: '0' }
+          - globals.set: { id: time_yellow, value: '0' }
+          - globals.set: { id: time_red,    value: '0' }
+
+
+# ----------------------------------------------------------------------------
 # Globals
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Naming convention:
+#   user_*     — user preferences (persisted across reboots)
+#   peak_*     — extreme values observed since boot (transient)
+#   time_*     — accumulated seconds per air quality category today
+#   led_*      — LED state machine flags
+#   *_count    — persistent counters
 globals:
-  - id: brightness_initialized
-    type: bool
-    restore_value: true
-    initial_value: 'false'
-  # Tracks whether we've set the LED color at least once since this boot.
-  - id: led_first_update_done
-    type: bool
-    restore_value: false   # resets to false on every boot
-    initial_value: 'false'
-  # Persists the user's last "on" / "off" choice across reboots.
+  # --- User preferences that persist across reboots ---
   - id: user_wants_led_on
     type: bool
     restore_value: true
     initial_value: 'true'
-  # Persists the user's chosen brightness explicitly.
   - id: user_brightness
     type: float
     restore_value: true
     initial_value: '0.25'
-  # Becomes true 5s after boot, indicating the LED driver is initialized
-  # and safe to drive. Avoids a crash if the script fires before then.
+  - id: brightness_initialized
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+  # --- LED driver readiness flag ---
+  # False until 5s after boot. Guards the WS2812 driver from being written
+  # to before its buffer is initialized, and prevents background intervals
+  # from touching the I2C bus while SCD41/SGP41 are still initializing.
   - id: led_ready
     type: bool
     restore_value: false
     initial_value: 'false'
 
-# ---------------------------------------------------------------------------
+  # --- Peak observations since boot (reset by "Reset Peak Values" button) ---
+  # Initialized to impossible-in-practice values so the first real reading
+  # always wins (e.g. temp_min starts at +100°C, not 0, so a 22°C reading
+  # correctly becomes the new min).
+  - id: peak_co2
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: peak_voc
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: peak_nox
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: peak_temp_max
+    type: float
+    restore_value: false
+    initial_value: '-100.0'
+  - id: peak_temp_min
+    type: float
+    restore_value: false
+    initial_value: '100.0'
+  - id: peak_rh_max
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: peak_rh_min
+    type: float
+    restore_value: false
+    initial_value: '100.0'
+
+  # --- Daily air quality time counters (seconds) ---
+  # Persisted so a mid-day reboot doesn't lose the day's data.
+  - id: time_green
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: time_yellow
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: time_red
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+
+  # --- Diagnostics ---
+  - id: reboot_count
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_crash_reason
+    type: std::string
+    restore_value: true
+    initial_value: '"None"'
+
+
+# ----------------------------------------------------------------------------
 # I2C bus
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 50 kHz is a deliberate compromise: slow enough to be forgiving of the
+# custom PCB's decoupling/routing, fast enough that all four sensors get
+# polled within their update intervals. All Sensirion sensors on this
+# board have well-separated addresses so no bus expander is needed.
 i2c:
   sda: GPIO7
   scl: GPIO8
   scan: true
   frequency: 50kHz
 
-# ---------------------------------------------------------------------------
-# Sensors
-# ---------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# User-configurable thresholds (Number entities)
+# ----------------------------------------------------------------------------
+# These appear as sliders in the Configuration section of the Home Assistant
+# device page. Values are persisted; the `initial_value` only applies on the
+# very first boot.
+#
+# CO2 thresholds are used when the SCD41 is producing readings. VOC
+# thresholds are the fallback path when the SCD41 is offline.
+number:
+  # --- CO2 thresholds (ppm) ---
+  - platform: template
+    name: "Threshold CO2 Green→Yellow"
+    id: threshold_co2_yellow
+    entity_category: config
+    unit_of_measurement: "ppm"
+    min_value: 400
+    max_value: 2000
+    step: 50
+    initial_value: 800
+    restore_value: true
+    optimistic: true
+    mode: box
+  - platform: template
+    name: "Threshold CO2 Yellow→Red"
+    id: threshold_co2_red
+    entity_category: config
+    unit_of_measurement: "ppm"
+    min_value: 400
+    max_value: 3000
+    step: 50
+    initial_value: 1200
+    restore_value: true
+    optimistic: true
+    mode: box
+  - platform: template
+    name: "Threshold CO2 Pulse (Critical)"
+    id: threshold_co2_pulse
+    entity_category: config
+    unit_of_measurement: "ppm"
+    min_value: 1000
+    max_value: 4000
+    step: 50
+    initial_value: 1500
+    restore_value: true
+    optimistic: true
+    mode: box
+
+  # --- VOC index thresholds (unitless, ~100 = clean baseline) ---
+  - platform: template
+    name: "Threshold VOC Green→Yellow"
+    id: threshold_voc_yellow
+    entity_category: config
+    min_value: 50
+    max_value: 500
+    step: 10
+    initial_value: 150
+    restore_value: true
+    optimistic: true
+    mode: box
+  - platform: template
+    name: "Threshold VOC Yellow→Red"
+    id: threshold_voc_red
+    entity_category: config
+    min_value: 100
+    max_value: 500
+    step: 10
+    initial_value: 250
+    restore_value: true
+    optimistic: true
+    mode: box
+  - platform: template
+    name: "Threshold VOC Pulse (Critical)"
+    id: threshold_voc_pulse
+    entity_category: config
+    min_value: 200
+    max_value: 500
+    step: 10
+    initial_value: 350
+    restore_value: true
+    optimistic: true
+    mode: box
+
+
+# ----------------------------------------------------------------------------
+# Boost mode
+# ----------------------------------------------------------------------------
+# A HA switch that flips all four sensors from 30s update intervals down
+# to 5s for fast feedback (e.g. while cooking). Restores 30s when off.
+#
+# Important: uses stop_poller/start_poller instead of call_setup — the
+# latter re-runs the sensor's chip-level init (including new I2C setup
+# commands) which reliably wedges the SCD41 and SGP41.
+switch:
+  - platform: template
+    name: "Boost Mode"
+    id: boost_mode
+    icon: "mdi:speedometer"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - logger.log: "Boost mode ON — 5s intervals"
+      - lambda: |-
+          id(sht40_sensor).stop_poller();
+          id(sht40_sensor).set_update_interval(5000);
+          id(sht40_sensor).start_poller();
+          id(bmp280_sensor).stop_poller();
+          id(bmp280_sensor).set_update_interval(5000);
+          id(bmp280_sensor).start_poller();
+          id(scd41_sensor).stop_poller();
+          id(scd41_sensor).set_update_interval(5000);
+          id(scd41_sensor).start_poller();
+          id(sgp41_sensor).stop_poller();
+          id(sgp41_sensor).set_update_interval(5000);
+          id(sgp41_sensor).start_poller();
+    turn_off_action:
+      - logger.log: "Boost mode OFF — back to 30s intervals"
+      - lambda: |-
+          id(sht40_sensor).stop_poller();
+          id(sht40_sensor).set_update_interval(30000);
+          id(sht40_sensor).start_poller();
+          id(bmp280_sensor).stop_poller();
+          id(bmp280_sensor).set_update_interval(30000);
+          id(bmp280_sensor).start_poller();
+          id(scd41_sensor).stop_poller();
+          id(scd41_sensor).set_update_interval(30000);
+          id(scd41_sensor).start_poller();
+          id(sgp41_sensor).stop_poller();
+          id(sgp41_sensor).set_update_interval(30000);
+          id(sgp41_sensor).start_poller();
+
+
+# ============================================================================
+# SENSORS
+# ============================================================================
 sensor:
-  # --- SHT40: temperature + humidity (high accuracy) ---
-  # The SHT40 is the most accurate T/H sensor on the board, but it sits on
-  # a PCB that self-heats from the SGP41 heater (~400°C internally),
-  # ESP32-C3 with WiFi, and the regulators. Calibrate the offsets below
-  # against a trusted reference thermometer.
+
+  # --------------------------------------------------------------------------
+  # RAW HARDWARE SENSORS
+  # --------------------------------------------------------------------------
+  # Each physical sensor's outputs are marked entity_category: diagnostic —
+  # they're kept in HA for comparison and debugging, but the primary
+  # temperature/humidity entities shown to users are the consolidated ones
+  # further below.
+  #
+  # All temperature offsets compensate for board self-heating (SGP41 hot-
+  # plate + ESP32 WiFi + regulators warm the PCB ~5.5°C above ambient).
+  # Values were tuned against a reference thermometer at steady state.
+  # --------------------------------------------------------------------------
+
+  # SHT40 — high-accuracy temperature and humidity reference (±0.2°C, ±1.8%).
+  # Also feeds the SGP41's gas index compensation algorithm.
   - platform: sht4x
+    id: sht40_sensor
     address: 0x44
     update_interval: 30s
     temperature:
       name: "Temperature (SHT40)"
       id: sht40_temperature
+      entity_category: diagnostic
       filters:
-        # Subtract self-heating offset. Tune empirically: place a known-good
-        # thermometer next to the board, let everything stabilize for 30+
-        # minutes, and adjust this until they match.
         - offset: -5.5
     humidity:
       name: "Humidity (SHT40)"
       id: sht40_humidity
+      entity_category: diagnostic
       filters:
-        # When the board reads ~5°C high, RH reads ~10-15% low because RH
-        # is temperature-dependent. We add back a small offset; better
-        # accuracy comes from physically separating sensors in next revision.
         - offset: 8.0
 
-  # --- BMP280: pressure + temperature ---
+  # BMP280 — barometric pressure (primary) and a secondary temperature
+  # reading. Pressure feeds the SCD41's ambient pressure compensation.
   - platform: bmp280_i2c
+    id: bmp280_sensor
     address: 0x76
     update_interval: 30s
     temperature:
       name: "Temperature (BMP280)"
+      id: bmp280_temperature
+      entity_category: diagnostic
       oversampling: 16x
       filters:
         - offset: -5.5
@@ -129,16 +457,15 @@ sensor:
       name: "Pressure"
       id: bmp280_pressure
 
-  # --- SCD41: CO2, temperature, humidity ---
+  # SCD41 — photoacoustic NDIR CO2 measurement. Also produces a tertiary
+  # temperature and humidity reading from its internal environmental
+  # sensor. Firing update_air_quality_led on every new CO2 reading keeps
+  # the LED responsive.
   - platform: scd4x
     id: scd41_sensor
     address: 0x62
     update_interval: 30s
     measurement_mode: periodic
-    # Keep the chip's internal offset at default (4°C). Additional
-    # compensation for board self-heating is applied via filter offsets
-    # on the individual sensor outputs below, matching how SHT40 and
-    # BMP280 handle it.
     ambient_pressure_compensation_source: bmp280_pressure
     co2:
       name: "CO2"
@@ -148,42 +475,533 @@ sensor:
           - script.execute: update_air_quality_led
     temperature:
       name: "Temperature (SCD41)"
+      id: scd41_temperature
+      entity_category: diagnostic
       filters:
-        # Adjusts for additional board self-heating beyond what the chip's
-        # own 4°C internal offset compensates for. Tune to match SHT40.
         - offset: -1.5
     humidity:
       name: "Humidity (SCD41)"
+      id: scd41_humidity
+      entity_category: diagnostic
       filters:
-        # Higher temp reading on the SCD41 also caused humidity to read low.
         - offset: 4.0
 
-  # --- SGP41: VOC + NOx index (with humidity compensation from SHT40) ---
+  # SGP41 — MOX-based VOC and NOx index (self-calibrating around 100 for
+  # VOC baseline, ~1 for clean NOx). Uses consolidated T/H for
+  # compensation so a single drifting sensor doesn't poison the gas index.
   - platform: sgp4x
+    id: sgp41_sensor
     update_interval: 30s
     compensation:
-      humidity_source: sht40_humidity
-      temperature_source: sht40_temperature
+      humidity_source: humidity_main
+      temperature_source: temperature_main
     voc:
       name: "VOC Index"
       id: voc_index
       on_value:
         then:
-          # VOC drives the LED as a fallback when CO2 isn't available
           - script.execute: update_air_quality_led
     nox:
       name: "NOx Index"
       id: nox_index
 
-# ---------------------------------------------------------------------------
-# Lights: WS2812 air-quality indicator (GPIO6) and fault LED (GPIO5)
-# ---------------------------------------------------------------------------
+
+  # --------------------------------------------------------------------------
+  # CONSOLIDATED PRIMARY SENSORS
+  # --------------------------------------------------------------------------
+  # These are the "Temperature" and "Humidity" entities users see in the
+  # main HA card. Each combines all available raw sensors using a
+  # median-based consensus with outlier rejection, so a drifting or dead
+  # sensor doesn't silently corrupt the displayed value.
+  # --------------------------------------------------------------------------
+
+  # Consolidated temperature from up to three sensors (SHT40, BMP280, SCD41).
+  #
+  # Algorithm:
+  #   1. Collect all sensors that have a valid state.
+  #   2. Compute the median.
+  #   3. Reject any sensor whose reading differs from the median by more
+  #      than 2°C — considered "drifting" and excluded from the average.
+  #   4. From the remaining healthy sensors, compute a weighted mean with
+  #      SHT40 weighted 2× (it's the highest-accuracy reference).
+  #
+  # Result: robust to any single sensor drifting or failing.
+  - platform: template
+    name: "Temperature"
+    id: temperature_main
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      std::vector<float> values;
+      if (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state))
+        values.push_back(id(sht40_temperature).state);
+      if (id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state))
+        values.push_back(id(bmp280_temperature).state);
+      if (id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state))
+        values.push_back(id(scd41_temperature).state);
+      if (values.empty()) return NAN;
+      if (values.size() == 1) return values[0];
+
+      std::sort(values.begin(), values.end());
+      float median = values.size() % 2
+        ? values[values.size() / 2]
+        : (values[values.size() / 2 - 1] + values[values.size() / 2]) / 2.0f;
+
+      std::vector<float> healthy;
+      for (float v : values) {
+        if (fabsf(v - median) <= 2.0f) healthy.push_back(v);
+      }
+      if (healthy.empty()) return median;
+
+      float sum = 0.0f, weight_total = 0.0f;
+      for (float v : healthy) {
+        float w = 1.0f;
+        if (id(sht40_temperature).has_state()
+            && fabsf(v - id(sht40_temperature).state) < 0.01f) {
+          w = 2.0f;
+        }
+        sum += v * w;
+        weight_total += w;
+      }
+      return sum / weight_total;
+
+  # Consolidated humidity from SHT40 and SCD41 (BMP280 has no humidity).
+  # With only two sources, "median" degrades to their average. If they
+  # disagree by more than 10% RH, we prefer the SHT40 reading; otherwise
+  # weighted mean with SHT40 counting 2×.
+  - platform: template
+    name: "Humidity"
+    id: humidity_main
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      std::vector<float> values;
+      if (id(sht40_humidity).has_state() && !isnan(id(sht40_humidity).state))
+        values.push_back(id(sht40_humidity).state);
+      if (id(scd41_humidity).has_state() && !isnan(id(scd41_humidity).state))
+        values.push_back(id(scd41_humidity).state);
+      if (values.empty()) return NAN;
+      if (values.size() == 1) return values[0];
+
+      // Disagreement > 10% RH: SHT40 wins (it's the reference part).
+      if (fabsf(values[0] - values[1]) > 10.0f) {
+        if (id(sht40_humidity).has_state()) return id(sht40_humidity).state;
+        return (values[0] + values[1]) / 2.0f;
+      }
+      // Otherwise weighted mean: SHT40 counts double.
+      if (id(sht40_humidity).has_state() && id(scd41_humidity).has_state()) {
+        return (id(sht40_humidity).state * 2.0f + id(scd41_humidity).state) / 3.0f;
+      }
+      return (values[0] + values[1]) / 2.0f;
+
+
+  # --------------------------------------------------------------------------
+  # DERIVED SENSORS (computed from consolidated T/H)
+  # --------------------------------------------------------------------------
+
+  # Absolute humidity in g/m³ via the Magnus-Tetens formula. Unlike
+  # relative humidity, absolute humidity is invariant to temperature —
+  # useful for mold-risk analysis and comparing indoor vs outdoor air.
+  - platform: template
+    name: "Absolute Humidity"
+    id: absolute_humidity
+    unit_of_measurement: "g/m³"
+    icon: "mdi:water-percent"
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      if (!id(temperature_main).has_state() || !id(humidity_main).has_state())
+        return NAN;
+      float T = id(temperature_main).state;
+      float RH = id(humidity_main).state;
+      if (isnan(T) || isnan(RH)) return NAN;
+      float es = 6.112f * expf((17.62f * T) / (243.12f + T));
+      float e = es * RH / 100.0f;
+      return (e * 100.0f) / (461.5f * (T + 273.15f)) * 1000.0f;
+
+  # Dew point via Magnus formula. Key metric for mold risk: if any wall
+  # surface drops below the dew point, condensation forms there.
+  - platform: template
+    name: "Dew Point"
+    id: dew_point
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      if (!id(temperature_main).has_state() || !id(humidity_main).has_state())
+        return NAN;
+      float T = id(temperature_main).state;
+      float RH = id(humidity_main).state;
+      if (isnan(T) || isnan(RH)) return NAN;
+      float alpha = (17.62f * T) / (243.12f + T) + logf(RH / 100.0f);
+      return (243.12f * alpha) / (17.62f - alpha);
+
+  # Aggregate air quality score, 0-100 (higher = better).
+  #
+  # Weighted composite:
+  #   CO2                40%    — best single indicator of indoor air freshness
+  #   VOC index          25%    — captures cooking, cleaning, off-gassing
+  #   NOx index          15%    — captures combustion (gas stove, candles)
+  #   Temperature comfort 10%   — thermal comfort per ASHRAE
+  #   Humidity comfort    10%   — thermal comfort per ASHRAE
+  #
+  # Sub-scores clamp linearly between "ideal" (100) and "bad" (0). Missing
+  # sensors contribute a neutral 50 rather than failing the whole score.
+  - platform: template
+    name: "Air Quality Score"
+    id: air_quality_score
+    unit_of_measurement: "%"
+    icon: "mdi:leaf"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      auto score_range = [](float v, float ideal, float bad) {
+        if (isnan(v)) return 50.0f;
+        if (v <= ideal) return 100.0f;
+        if (v >= bad) return 0.0f;
+        return 100.0f * (bad - v) / (bad - ideal);
+      };
+      auto score_comfort_range = [](float v, float min_ok, float max_ok,
+                                    float min_bad, float max_bad) {
+        if (isnan(v)) return 50.0f;
+        if (v >= min_ok && v <= max_ok) return 100.0f;
+        if (v <= min_bad || v >= max_bad) return 0.0f;
+        if (v < min_ok) return 100.0f * (v - min_bad) / (min_ok - min_bad);
+        return 100.0f * (max_bad - v) / (max_bad - max_ok);
+      };
+
+      float co2  = id(co2_value).has_state()        ? id(co2_value).state        : NAN;
+      float voc  = id(voc_index).has_state()        ? id(voc_index).state        : NAN;
+      float nox  = id(nox_index).has_state()        ? id(nox_index).state        : NAN;
+      float temp = id(temperature_main).has_state() ? id(temperature_main).state : NAN;
+      float rh   = id(humidity_main).has_state()    ? id(humidity_main).state    : NAN;
+
+      return score_range(co2, 600.0f, 1500.0f)          * 0.40f
+           + score_range(voc, 100.0f, 300.0f)           * 0.25f
+           + score_range(nox, 1.0f,   50.0f)            * 0.15f
+           + score_comfort_range(temp, 20.0f, 24.0f, 15.0f, 30.0f) * 0.10f
+           + score_comfort_range(rh,   40.0f, 60.0f, 25.0f, 75.0f) * 0.10f;
+
+
+  # --------------------------------------------------------------------------
+  # DIAGNOSTIC SENSORS
+  # --------------------------------------------------------------------------
+
+  # Per-sensor health, 100% if publishing a valid state, 0% otherwise.
+  # Trivial today (a sensor is either alive or dead), but wired as
+  # individual entities so future logic (staleness detection, drift
+  # tracking) can plug in without touching the fault LED logic.
+  - platform: template
+    name: "SCD41 Health"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return (id(co2_value).has_state() && !isnan(id(co2_value).state)) ? 100.0f : 0.0f;
+  - platform: template
+    name: "SGP41 Health"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return (id(voc_index).has_state() && !isnan(id(voc_index).state)) ? 100.0f : 0.0f;
+  - platform: template
+    name: "SHT40 Health"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state)) ? 100.0f : 0.0f;
+  - platform: template
+    name: "BMP280 Health"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return (id(bmp280_pressure).has_state() && !isnan(id(bmp280_pressure).state)) ? 100.0f : 0.0f;
+
+  # --- Peak values observed since last boot or "Reset Peak Values" press ---
+  - platform: template
+    name: "Peak CO2 (since boot)"
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_co2);'
+  - platform: template
+    name: "Peak VOC (since boot)"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_voc);'
+  - platform: template
+    name: "Peak NOx (since boot)"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_nox);'
+  - platform: template
+    name: "Peak Temperature Max"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_temp_max) > -50.0f ? id(peak_temp_max) : NAN;'
+  - platform: template
+    name: "Peak Temperature Min"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_temp_min) < 50.0f ? id(peak_temp_min) : NAN;'
+  - platform: template
+    name: "Peak Humidity Max"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_rh_max);'
+  - platform: template
+    name: "Peak Humidity Min"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(peak_rh_min) < 100.0f ? id(peak_rh_min) : NAN;'
+
+  # --- Daily time-in-category counters (converted from seconds to minutes) ---
+  - platform: template
+    name: "Time Green Today"
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(time_green) / 60.0f;'
+  - platform: template
+    name: "Time Yellow Today"
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(time_yellow) / 60.0f;'
+  - platform: template
+    name: "Time Red Today"
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(time_red) / 60.0f;'
+
+  # --- Boot / uptime counters ---
+  - platform: template
+    name: "Reboot Count"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 300s
+    lambda: 'return id(reboot_count);'
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    entity_category: diagnostic
+    update_interval: 60s
+
+  # 5V rail monitoring via a 10k/10k voltage divider on GPIO3 (ADC1_CH3).
+  #
+  # The nominal multiplier for a 1:2 divider would be 2.0, but the
+  # ESP32-C3's uncalibrated ADC reads systematically low at 12dB
+  # attenuation. Empirical single-point calibration: a multimeter-verified
+  # 5.05V rail read as 3.79V (with multiplier 2.0), so the corrected
+  # multiplier is 2.0 * (5.05 / 3.79) ≈ 2.665.
+  #
+  # Useful for spotting brownouts, marginal USB cables, and correlating
+  # supply sags with sensor init failures.
+  - platform: adc
+    pin: GPIO3
+    name: "5V Rail Voltage"
+    id: rail_5v
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    attenuation: 12db
+    update_interval: 30s
+    filters:
+      - multiply: 2.665
+      - sliding_window_moving_average:
+          window_size: 4
+          send_every: 1
+
+
+# ============================================================================
+# TEXT SENSORS (diagnostic status strings + comfort classification)
+# ============================================================================
+text_sensor:
+
+  # Static firmware version stamped by the flash.sh wrapper from git state.
+  - platform: template
+    name: "Firmware Version"
+    icon: "mdi:package-variant"
+    entity_category: diagnostic
+    update_interval: 300s
+    lambda: |-
+      return {"${firmware_version}"};
+
+  # Human-readable uptime including reboot count, e.g. "3d 7h 45m (reboots: 2)".
+  - platform: template
+    name: "Uptime Story"
+    icon: "mdi:clock-outline"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      uint32_t total = id(uptime_sensor).has_state()
+                     ? (uint32_t) id(uptime_sensor).state : 0;
+      uint32_t days    = total / 86400;
+      uint32_t hours   = (total % 86400) / 3600;
+      uint32_t minutes = (total % 3600) / 60;
+      char buf[80];
+      snprintf(buf, sizeof(buf), "%ud %uh %um (reboots: %u)",
+               days, hours, minutes, (unsigned) id(reboot_count));
+      return {std::string(buf)};
+
+  # Placeholder for future ESP32 crash-reason capture. Populated on next
+  # boot after a crash if we wire in an esp32.crash reader (not yet done).
+  - platform: template
+    name: "Last Crash Reason"
+    icon: "mdi:alert-circle-outline"
+    entity_category: diagnostic
+    update_interval: 300s
+    lambda: |-
+      return {id(last_crash_reason)};
+
+  # Which temperature sensors currently contribute to the consolidated
+  # value, with drift annotations for any sensor that disagrees with the
+  # consensus by more than 2°C. Example strings:
+  #   "SHT40, BMP280, SCD41"                    — all in agreement
+  #   "SHT40, BMP280, SCD41 (+2.8 drift)"       — SCD41 is drifting hot
+  - platform: template
+    name: "Temperature Sources"
+    icon: "mdi:thermometer-check"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      std::vector<std::pair<std::string,float>> sensors;
+      if (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state))
+        sensors.push_back({"SHT40", id(sht40_temperature).state});
+      if (id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state))
+        sensors.push_back({"BMP280", id(bmp280_temperature).state});
+      if (id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state))
+        sensors.push_back({"SCD41", id(scd41_temperature).state});
+      if (sensors.empty()) return {"none available"};
+      if (!id(temperature_main).has_state()) return {"computing..."};
+
+      float main = id(temperature_main).state;
+      std::string result;
+      for (auto &s : sensors) {
+        if (!result.empty()) result += ", ";
+        result += s.first;
+        float d = s.second - main;
+        if (fabsf(d) > 2.0f) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), " (%+.1f drift)", d);
+          result += buf;
+        }
+      }
+      return {result};
+
+  # Same as Temperature Sources but for humidity, with a 10% RH drift
+  # threshold. Only SHT40 and SCD41 measure humidity.
+  - platform: template
+    name: "Humidity Sources"
+    icon: "mdi:water-check"
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      std::vector<std::pair<std::string,float>> sensors;
+      if (id(sht40_humidity).has_state() && !isnan(id(sht40_humidity).state))
+        sensors.push_back({"SHT40", id(sht40_humidity).state});
+      if (id(scd41_humidity).has_state() && !isnan(id(scd41_humidity).state))
+        sensors.push_back({"SCD41", id(scd41_humidity).state});
+      if (sensors.empty()) return {"none available"};
+      if (!id(humidity_main).has_state()) return {"computing..."};
+
+      float main = id(humidity_main).state;
+      std::string result;
+      for (auto &s : sensors) {
+        if (!result.empty()) result += ", ";
+        result += s.first;
+        float d = s.second - main;
+        if (fabsf(d) > 10.0f) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), " (%+.1f drift)", d);
+          result += buf;
+        }
+      }
+      return {result};
+
+  # ASHRAE-inspired comfort classification. Simple thresholds, but useful
+  # as an at-a-glance "is my room habitable" indicator.
+  - platform: template
+    name: "Comfort Zone"
+    icon: "mdi:home-thermometer"
+    update_interval: 60s
+    lambda: |-
+      if (!id(temperature_main).has_state() || !id(humidity_main).has_state())
+        return {"Unknown"};
+      float T = id(temperature_main).state;
+      float RH = id(humidity_main).state;
+      if (isnan(T) || isnan(RH)) return {"Unknown"};
+      if (T < 18.0f) return {"Too cold"};
+      if (T > 26.0f) return {"Too hot"};
+      if (RH < 30.0f) return {"Too dry"};
+      if (RH > 70.0f) return {"Too humid"};
+      if (T >= 20.0f && T <= 24.0f && RH >= 40.0f && RH <= 60.0f)
+        return {"Comfortable"};
+      return {"Acceptable"};
+
+
+# ============================================================================
+# LEDS
+# ============================================================================
+# The board carries two indicator LEDs:
+#   * WS2812 addressable RGB on GPIO6 — the "air quality LED"
+#   * A single-color LED on GPIO5    — the "fault LED"
+# ============================================================================
+
+# Discrete fault LED output.
 output:
   - platform: gpio
     pin: GPIO5
     id: fault_led_output
 
 light:
+
+  # WS2812 air quality indicator.
+  #
+  # The color and pulse state are driven by the update_air_quality_led
+  # script (see below), which reads the current CO2/VOC values and the
+  # user-configurable thresholds. The brightness and on/off state are
+  # owned by the user via HA — the script preserves whatever the user
+  # sets and never overrides it.
+  #
+  # `restore_mode: RESTORE_DEFAULT_OFF` prevents a bright white flash at
+  # boot: WS2812s power up with uninitialized memory that often reads as
+  # full-white, so we explicitly start OFF and let the script take over
+  # once led_ready is set.
   - platform: esp32_rmt_led_strip
     id: air_quality_led
     name: "Air Quality LED"
@@ -196,9 +1014,8 @@ light:
       - globals.set:
           id: user_wants_led_on
           value: 'true'
-      # Capture brightness on each turn-on. HA's brightness slider sends
-      # a turn_on with the new brightness, so this also captures slider
-      # changes while the LED is already on.
+      # HA's brightness slider emits `turn_on` with the new brightness,
+      # so we capture it here to persist across reboots.
       - lambda: |-
           float b = id(air_quality_led).remote_values.get_brightness();
           if (b > 0.0f && b <= 1.0f) id(user_brightness) = b;
@@ -207,28 +1024,36 @@ light:
           id: user_wants_led_on
           value: 'false'
     effects:
+      # Applied when CO2/VOC exceeds the pulse threshold. Kept mild
+      # (30-80% brightness range, 1s cycle) to be noticeable but not
+      # distracting for a device that sits on a shelf.
       - pulse:
-          name: "Pulse"
+          name: "Critical Pulse"
+          transition_length: 1000ms
+          update_interval: 1000ms
+          min_brightness: 30%
+          max_brightness: 80%
 
+  # Discrete fault LED. Auto-driven by the 30s fault-check interval, but
+  # can also be triggered manually via the "Test Fault LED" button.
   - platform: binary
     id: fault_led
     name: "Fault LED"
     output: fault_led_output
-    # Fault LED is purely auto-controlled; always start off and let the
-    # fault logic drive it.
+    entity_category: diagnostic
     restore_mode: ALWAYS_OFF
 
-# ---------------------------------------------------------------------------
-# Buttons for diagnostics / recovery (accessible via web UI)
-# ---------------------------------------------------------------------------
-button:
-  - platform: template
-    name: "SCD41 Factory Reset"
-    on_press:
-      - lambda: 'id(scd41_sensor).factory_reset();'
-      - delay: 2s
-      - button.press: restart_esp_button
 
+# ============================================================================
+# BUTTONS
+# ============================================================================
+# Test Fault LED lives in the user-facing controls section (no
+# entity_category). Everything else is a diagnostic/recovery action and
+# stays in the Diagnostic section.
+button:
+
+  # Manually pulse the fault LED for 2 seconds so users can confirm it
+  # actually works without waiting for a real sensor failure.
   - platform: template
     name: "Test Fault LED"
     on_press:
@@ -236,58 +1061,107 @@ button:
       - delay: 2s
       - light.turn_off: fault_led
 
+  # SCD41 recovery: factory_reset() re-programs default calibration and
+  # clears any stuck internal state, then we reboot the ESP so it goes
+  # through a clean setup cycle. Occasionally useful if the CO2 sensor
+  # gets wedged.
+  - platform: template
+    name: "SCD41 Factory Reset"
+    entity_category: diagnostic
+    on_press:
+      - lambda: 'id(scd41_sensor).factory_reset();'
+      - delay: 2s
+      - button.press: restart_esp_button
+
+  # Reset the peak observations back to their sentinel values so the next
+  # measurement in each channel establishes a new peak.
+  - platform: template
+    name: "Reset Peak Values"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(peak_co2)      = 0.0f;
+          id(peak_voc)      = 0.0f;
+          id(peak_nox)      = 0.0f;
+          id(peak_temp_max) = -100.0f;
+          id(peak_temp_min) = 100.0f;
+          id(peak_rh_max)   = 0.0f;
+          id(peak_rh_min)   = 100.0f;
+          ESP_LOGI("peak", "Peak values reset");
+
   - platform: restart
     id: restart_esp_button
     name: "Restart ESP"
+    entity_category: diagnostic
 
-# ---------------------------------------------------------------------------
-# Air-quality color logic
-# Prefers CO2 from SCD41 if available; falls back to VOC index from SGP41.
-# IMPORTANT: only the COLOR is set by firmware. Brightness and on/off state
-# are owned by the user (controllable from Home Assistant and persisted).
-# We read the current brightness and on/off state before updating color, then
-# re-apply them so the user's choices aren't clobbered.
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# AIR QUALITY LED CONTROL SCRIPT
+# ============================================================================
+# Called from the SCD41 and SGP41 sensor on_value handlers so the LED
+# updates immediately when a new reading arrives.
+#
+# Preferred source is raw CO2 (SCD41); VOC index (SGP41) is the fallback
+# path when CO2 is unavailable. Each source has its own configurable
+# yellow/red/pulse thresholds sourced from HA Number entities.
+#
+# Contract:
+#   * Do nothing until led_ready is true (guards WS2812 driver init).
+#   * Preserve the user's brightness and on/off preference; only update
+#     the color and the pulse-effect state.
+#   * `set_transition_length(0)` avoids overlapping transitions when
+#     both CO2 and VOC arrive back-to-back.
+# ============================================================================
 script:
   - id: update_air_quality_led
     then:
       - lambda: |-
-          // Don't touch the LED until 5s after boot — the WS2812 driver
-          // can crash if poked before its internal buffer is initialized.
           if (!id(led_ready)) return;
 
+          // --- Establish the current brightness (first-run safety) ---
           float brightness = id(user_brightness);
-
-          // First-boot safety: if somehow brightness is invalid, use 25%.
           if (brightness <= 0.0f || brightness > 1.0f) {
             brightness = 0.25f;
             id(user_brightness) = brightness;
           }
-
           if (!id(brightness_initialized)) {
             id(brightness_initialized) = true;
           }
 
-          // Decide target color from sensor data.
-          float r = 0.0f, g = 0.0f, b = 0.0f;
-          bool have_color = false;
+          // --- Select source (CO2 preferred, VOC fallback) ---
+          bool  have_source = false;
+          float value = 0.0f, t_yellow = 0.0f, t_red = 0.0f, t_pulse = 0.0f;
 
           if (id(co2_value).has_state() && !isnan(id(co2_value).state)) {
-            float co2 = id(co2_value).state;
-            if      (co2 < 800)  { r = 0.0f; g = 1.0f; b = 0.0f; }
-            else if (co2 < 1200) { r = 1.0f; g = 1.0f; b = 0.0f; }
-            else                 { r = 1.0f; g = 0.0f; b = 0.0f; }
-            have_color = true;
+            value    = id(co2_value).state;
+            t_yellow = id(threshold_co2_yellow).state;
+            t_red    = id(threshold_co2_red).state;
+            t_pulse  = id(threshold_co2_pulse).state;
+            have_source = true;
           } else if (id(voc_index).has_state() && !isnan(id(voc_index).state)) {
-            float voc = id(voc_index).state;
-            if      (voc < 150) { r = 0.0f; g = 1.0f; b = 0.0f; }
-            else if (voc < 250) { r = 1.0f; g = 1.0f; b = 0.0f; }
-            else                { r = 1.0f; g = 0.0f; b = 0.0f; }
-            have_color = true;
+            value    = id(voc_index).state;
+            t_yellow = id(threshold_voc_yellow).state;
+            t_red    = id(threshold_voc_red).state;
+            t_pulse  = id(threshold_voc_pulse).state;
+            have_source = true;
+          }
+          if (!have_source) return;
+
+          // --- Discrete 3-color mapping ---
+          // Hard stepped rather than HSV-interpolated: gradient mode caused
+          // perceptible flicker as brightness dithered between hues on every
+          // small value change.
+          float r = 0.0f, g = 0.0f, b = 0.0f;
+          if (value < t_yellow) {
+            r = 0.0f; g = 1.0f; b = 0.0f;   // green
+          } else if (value < t_red) {
+            r = 1.0f; g = 1.0f; b = 0.0f;   // yellow
+          } else {
+            r = 1.0f; g = 0.0f; b = 0.0f;   // red
           }
 
-          if (!have_color) return;
-
+          // --- Apply, preserving user's on/off preference ---
+          bool should_pulse = value >= t_pulse;
           bool should_be_on = id(user_wants_led_on);
 
           if (should_be_on) {
@@ -295,22 +1169,104 @@ script:
             call.set_rgb(r, g, b);
             call.set_brightness(brightness);
             call.set_transition_length(0);
+            call.set_effect(should_pulse ? "Critical Pulse" : "None");
             call.perform();
           } else {
+            // User turned the LED off: keep it off, but "prime" the color
+            // so the next turn_on shows the current air quality.
             auto call = id(air_quality_led).turn_off();
             call.set_rgb(r, g, b);
             call.set_brightness(brightness);
             call.perform();
           }
 
-          id(led_first_update_done) = true;
 
-# ---------------------------------------------------------------------------
-# Fault detection: fault LED is on whenever ANY sensor is missing data.
-# Re-evaluated whenever a sensor reports (via update_fault_state script call
-# in the on_value hooks above) AND every 30s as a backstop so we still catch
-# sensors going silent.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# BACKGROUND INTERVALS
+# ============================================================================
+# Two things run on periodic timers:
+#   * 1s tick — accumulates seconds into whichever air quality category
+#     the current CO2 reading falls into.
+#   * 10s tick — updates peak observations.
+#   * 30s tick — evaluates the fault condition and drives the fault LED.
+#
+# The 1s and 10s intervals both gate on led_ready to avoid touching the
+# I2C bus while SCD41/SGP41 are still initializing.
+# ============================================================================
+interval:
+
+  # Time-in-category counter. Runs once per second so the "Time Green/
+  # Yellow/Red Today" values are sub-minute accurate.
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(led_ready)) return;
+          if (!id(co2_value).has_state() || isnan(id(co2_value).state)) return;
+          float v  = id(co2_value).state;
+          float ty = id(threshold_co2_yellow).state;
+          float tr = id(threshold_co2_red).state;
+          if      (v < ty) { id(time_green)  += 1; }
+          else if (v < tr) { id(time_yellow) += 1; }
+          else             { id(time_red)    += 1; }
+
+  # Peak value tracking. Every 10s is fast enough to catch transients
+  # without hammering the globals every second.
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (!id(led_ready)) return;
+          if (id(co2_value).has_state()) {
+            float v = id(co2_value).state;
+            if (!isnan(v) && v > id(peak_co2)) id(peak_co2) = v;
+          }
+          if (id(voc_index).has_state()) {
+            float v = id(voc_index).state;
+            if (!isnan(v) && v > id(peak_voc)) id(peak_voc) = v;
+          }
+          if (id(nox_index).has_state()) {
+            float v = id(nox_index).state;
+            if (!isnan(v) && v > id(peak_nox)) id(peak_nox) = v;
+          }
+          if (id(sht40_temperature).has_state()) {
+            float v = id(sht40_temperature).state;
+            if (!isnan(v)) {
+              if (v > id(peak_temp_max)) id(peak_temp_max) = v;
+              if (v < id(peak_temp_min)) id(peak_temp_min) = v;
+            }
+          }
+          if (id(sht40_humidity).has_state()) {
+            float v = id(sht40_humidity).state;
+            if (!isnan(v)) {
+              if (v > id(peak_rh_max)) id(peak_rh_max) = v;
+              if (v < id(peak_rh_min)) id(peak_rh_min) = v;
+            }
+          }
+
+  # Fault detection and LED drive. A sensor is considered failed if it
+  # has no published state or its state is NaN. We drive the fault LED
+  # directly here instead of relying on the binary_sensor's on_state
+  # trigger, which would only fire on transitions — not while the state
+  # persists.
+  - interval: 30s
+    then:
+      - lambda: |-
+          bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
+          bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
+          bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
+          bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
+          bool is_fault = !(scd_ok && sht_ok && bmp_ok && voc_ok);
+          id(sensor_fault).publish_state(is_fault);
+          auto call = is_fault ? id(fault_led).turn_on() : id(fault_led).turn_off();
+          call.perform();
+
+
+# ============================================================================
+# FAULT BINARY SENSOR (HA-side representation)
+# ============================================================================
+# Its state is published from the 30s fault-detection interval above.
+# The lambda here handles the boot-time initial read (before the interval
+# has a chance to fire) and gets re-evaluated whenever a source sensor
+# publishes.
 binary_sensor:
   - platform: template
     name: "Sensor Fault"
@@ -322,25 +1278,3 @@ binary_sensor:
       bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
       bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
       return !(scd_ok && sht_ok && bmp_ok && voc_ok);
-    on_state:
-      then:
-        - if:
-            condition:
-              lambda: 'return x;'
-            then:
-              - light.turn_on: fault_led
-            else:
-              - light.turn_off: fault_led
-
-# Periodically recompute the fault state so we notice silent sensors.
-# Template binary_sensors aren't PollingComponents, so we re-trigger
-# their evaluation by publishing a fresh value via lambda.
-interval:
-  - interval: 30s
-    then:
-      - lambda: |-
-          bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
-          bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
-          bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
-          bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
-          id(sensor_fault).publish_state(!(scd_ok && sht_ok && bmp_ok && voc_ok));
