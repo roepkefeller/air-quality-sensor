@@ -1,0 +1,230 @@
+# ============================================================================
+# PM Sensor Package — PMSA003I particulate matter via QWIIC
+# ============================================================================
+#
+# Included by air-quality-sensor-pm.yaml alongside the base firmware.
+# DO NOT flash this file directly — use air-quality-sensor-pm.yaml.
+#
+# Adds:
+#   * PM1.0 / PM2.5 / PM10 mass concentration (primary HA entities)
+#   * 6 particle count channels (diagnostic)
+#   * Sensor: EPA AQI (PM2.5-based, US EPA breakpoints)
+#   * Sensor: Extended Air Quality Score (adds PM2.5 15%, rebalanced weights)
+#   * Text sensor: Particle Source (combustion vs coarse from PM2.5/PM10 ratio)
+#   * Text sensor: EPA AQI Category (human-readable label)
+#
+# In the PM variant the PMSA003I is a required sensor. The fault LED triggers
+# if it is missing from the I2C bus OR if it stops reporting data — same
+# behaviour as the onboard sensors.
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Sensors
+# ----------------------------------------------------------------------------
+sensor:
+
+  # --------------------------------------------------------------------------
+  # PMSA003I — mass concentration + particle counts
+  # --------------------------------------------------------------------------
+  # I2C address 0x12. If the sensor is not on the bus all sub-sensors remain
+  # without state ("unavailable" in HA), and extra_fault is raised.
+  - platform: pmsa003i
+    id: pmsa003i_sensor
+    address: 0x12
+    update_interval: 30s
+    pm_1_0:
+      name: "PM 1.0"
+      id: pm_1_0
+      unit_of_measurement: "µg/m³"
+      device_class: pm1
+      state_class: measurement
+      accuracy_decimals: 1
+    pm_2_5:
+      name: "PM 2.5"
+      id: pm_2_5
+      unit_of_measurement: "µg/m³"
+      device_class: pm25
+      state_class: measurement
+      accuracy_decimals: 1
+    pm_10_0:
+      name: "PM 10.0"
+      id: pm_10_0
+      unit_of_measurement: "µg/m³"
+      device_class: pm10
+      state_class: measurement
+      accuracy_decimals: 1
+    # Particle counts per 0.1 L of air — diagnostic, useful for distribution
+    # analysis (e.g. fine/coarse ratio, aerosol fingerprinting).
+    pmc_0_3:
+      name: "PMC >0.3µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+    pmc_0_5:
+      name: "PMC >0.5µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+    pmc_1_0:
+      name: "PMC >1.0µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+    pmc_2_5:
+      name: "PMC >2.5µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+    pmc_5_0:
+      name: "PMC >5.0µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+    pmc_10_0:
+      name: "PMC >10.0µm"
+      entity_category: diagnostic
+      state_class: measurement
+      accuracy_decimals: 0
+
+  # --------------------------------------------------------------------------
+  # US EPA AQI from PM2.5
+  # --------------------------------------------------------------------------
+  # Calculated using the official EPA linear interpolation formula across
+  # the seven PM2.5 concentration breakpoints. Gives a standardised 0-500
+  # index comparable to outdoor AQI values in weather apps.
+  #
+  # Breakpoints (24h avg µg/m³ → AQI):
+  #   0–12      Good            (  0– 50)
+  #   12.1–35.4 Moderate        ( 51–100)
+  #   35.5–55.4 Unhealthy/Sens  (101–150)
+  #   55.5–150  Unhealthy       (151–200)
+  #   150.5–250 Very Unhealthy  (201–300)
+  #   250.5–350 Hazardous       (301–400)
+  #   350.5–500 Hazardous+      (401–500)
+  - platform: template
+    name: "EPA AQI (PM2.5)"
+    id: epa_aqi
+    icon: "mdi:air-filter"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (!id(pm_2_5).has_state() || isnan(id(pm_2_5).state)) return NAN;
+      float c = id(pm_2_5).state;
+      const float c_lo[] = {  0.0f,  12.1f,  35.5f,  55.5f, 150.5f, 250.5f, 350.5f };
+      const float c_hi[] = { 12.0f,  35.4f,  55.4f, 150.4f, 250.4f, 350.4f, 500.4f };
+      const float i_lo[] = {  0.0f,  51.0f, 101.0f, 151.0f, 201.0f, 301.0f, 401.0f };
+      const float i_hi[] = { 50.0f, 100.0f, 150.0f, 200.0f, 300.0f, 400.0f, 500.0f };
+      for (int i = 0; i < 7; i++) {
+        if (c >= c_lo[i] && c <= c_hi[i])
+          return i_lo[i] + (c - c_lo[i]) * (i_hi[i] - i_lo[i]) / (c_hi[i] - c_lo[i]);
+      }
+      return 500.0f;
+
+  # --------------------------------------------------------------------------
+  # Extended Air Quality Score (with PM2.5)
+  # --------------------------------------------------------------------------
+  # Parallel to the base "Air Quality Score", but adds PM2.5 as a 15%
+  # contributor. Weights rebalanced relative to the base score:
+  #   CO2          35%   (was 40%)
+  #   VOC index    20%   (was 25%)
+  #   NOx index    15%   (unchanged)
+  #   PM2.5        15%   (new)
+  #   Temp comfort  7.5% (was 10%)
+  #   RH comfort    7.5% (was 10%)
+  #
+  # Missing sensors contribute a neutral 50 so the score degrades
+  # gracefully if any channel is offline.
+  - platform: template
+    name: "Air Quality Score (Extended)"
+    id: air_quality_score_extended
+    unit_of_measurement: "%"
+    icon: "mdi:leaf"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      auto score_range = [](float v, float ideal, float bad) -> float {
+        if (isnan(v)) return 50.0f;
+        if (v <= ideal) return 100.0f;
+        if (v >= bad)   return 0.0f;
+        return 100.0f * (bad - v) / (bad - ideal);
+      };
+      auto score_comfort = [](float v, float min_ok, float max_ok,
+                               float min_bad, float max_bad) -> float {
+        if (isnan(v)) return 50.0f;
+        if (v >= min_ok && v <= max_ok) return 100.0f;
+        if (v <= min_bad || v >= max_bad) return 0.0f;
+        if (v < min_ok) return 100.0f * (v - min_bad) / (min_ok - min_bad);
+        return 100.0f * (max_bad - v) / (max_bad - max_ok);
+      };
+
+      float co2  = id(co2_value).has_state()        ? id(co2_value).state        : NAN;
+      float voc  = id(voc_index).has_state()        ? id(voc_index).state        : NAN;
+      float nox  = id(nox_index).has_state()        ? id(nox_index).state        : NAN;
+      float temp = id(temperature_main).has_state() ? id(temperature_main).state : NAN;
+      float rh   = id(humidity_main).has_state()    ? id(humidity_main).state    : NAN;
+      float pm25 = id(pm_2_5).has_state()           ? id(pm_2_5).state           : NAN;
+
+      return score_range(co2,  600.0f, 1500.0f)                      * 0.35f
+           + score_range(voc,  100.0f,  300.0f)                      * 0.20f
+           + score_range(nox,    1.0f,   50.0f)                      * 0.15f
+           + score_range(pm25,   5.0f,   35.0f)                      * 0.15f
+           + score_comfort(temp, 20.0f, 24.0f, 15.0f, 30.0f)        * 0.075f
+           + score_comfort(rh,   40.0f, 60.0f, 25.0f, 75.0f)        * 0.075f;
+
+
+# ----------------------------------------------------------------------------
+# Fault detection — contributes to base firmware's fault LED
+# ----------------------------------------------------------------------------
+# In the PM variant the PMSA003I is required. extra_fault = true whenever
+# PM2.5 has no valid reading — this covers both "not found on I2C bus" and
+# "found but not reporting data".
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          bool pm_ok = id(pm_2_5).has_state() && !isnan(id(pm_2_5).state);
+          id(extra_fault) = !pm_ok;
+
+
+# ----------------------------------------------------------------------------
+# Text sensors — classification and labelling
+# ----------------------------------------------------------------------------
+text_sensor:
+
+  # Particle origin from the PM2.5/PM10 mass fraction.
+  # Fine fraction (PM2.5/PM10) correlates with particle origin:
+  #   > 0.7  combustion-dominated: cooking, candles, cigarettes, traffic
+  #   0.4–0.7 mixed sources
+  #   < 0.4  coarse-dominated: house dust, pollen, mechanical abrasion
+  - platform: template
+    name: "Particle Source"
+    icon: "mdi:grain"
+    update_interval: 60s
+    lambda: |-
+      if (!id(pm_2_5).has_state()  || isnan(id(pm_2_5).state))  return {"Unknown"};
+      if (!id(pm_10_0).has_state() || isnan(id(pm_10_0).state)) return {"Unknown"};
+      float pm25 = id(pm_2_5).state;
+      float pm10 = id(pm_10_0).state;
+      if (pm10 < 0.5f) return {"Unknown"};
+      float ratio = pm25 / pm10;
+      if (ratio > 0.7f) return {"Combustion (cooking / candles / traffic)"};
+      if (ratio > 0.4f) return {"Mixed"};
+      return {"Coarse (dust / pollen / abrasion)"};
+
+  # Human-readable EPA AQI category label.
+  - platform: template
+    name: "EPA AQI Category"
+    icon: "mdi:air-filter"
+    update_interval: 30s
+    lambda: |-
+      if (!id(epa_aqi).has_state() || isnan(id(epa_aqi).state)) return {"Unknown"};
+      float aqi = id(epa_aqi).state;
+      if (aqi <=  50) return {"Good"};
+      if (aqi <= 100) return {"Moderate"};
+      if (aqi <= 150) return {"Unhealthy for Sensitive Groups"};
+      if (aqi <= 200) return {"Unhealthy"};
+      if (aqi <= 300) return {"Very Unhealthy"};
+      return {"Hazardous"};

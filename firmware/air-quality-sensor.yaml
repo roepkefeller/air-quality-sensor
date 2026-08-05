@@ -60,6 +60,7 @@
 #     0x59        SGP41 (VOC + NOx index)
 #     0x62        SCD41 (CO2)
 #     0x76        BMP280 (pressure + temperature)
+#     0x12        PMSA003I (PM1.0/PM2.5/PM10, optional — PM variant only)
 #   WS2812 LED    GPIO6 (air quality indicator)
 #   Fault LED     GPIO5 (single-color fault indicator)
 #   5V ADC        GPIO3 (10k/10k divider tap for USB rail monitoring)
@@ -102,6 +103,9 @@ esphome:
           id: led_ready
           value: 'true'
       - lambda: 'id(reboot_count) += 1;'
+      - lambda: |-
+          i2c::ErrorCode err = id(i2c_bus)->write(0x12, nullptr, 0, true);
+          id(pm_addon_present) = (err == i2c::ERROR_OK);
 
 
 # ----------------------------------------------------------------------------
@@ -246,6 +250,24 @@ globals:
     restore_value: true
     initial_value: '0'
 
+  # --- Extra fault contribution from optional packages ---
+  # Stays false in base firmware. The PM package sets this true whenever
+  # PM2.5 has no valid reading — covers both missing on I2C and not reporting.
+  - id: extra_fault
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # --- PM sensor addon presence ---
+  # Probed via raw I2C write to 0x12 on boot and every 30s.
+  # True whenever the PMSA003I responds on the bus, regardless of which
+  # firmware variant is running — so even the base firmware shows the sensor
+  # as connected, prompting the user to flash the PM variant.
+  - id: pm_addon_present
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
   # --- Diagnostics ---
   - id: reboot_count
     type: uint32_t
@@ -265,6 +287,7 @@ globals:
 # polled within their update intervals. All Sensirion sensors on this
 # board have well-separated addresses so no bus expander is needed.
 i2c:
+  id: i2c_bus
   sda: GPIO7
   scl: GPIO8
   scan: true
@@ -1254,10 +1277,15 @@ interval:
           bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
           bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
           bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
-          bool is_fault = !(scd_ok && sht_ok && bmp_ok && voc_ok);
+          bool is_fault = !(scd_ok && sht_ok && bmp_ok && voc_ok) || id(extra_fault);
           id(sensor_fault).publish_state(is_fault);
           auto call = is_fault ? id(fault_led).turn_on() : id(fault_led).turn_off();
           call.perform();
+          // PM addon presence: probe I2C address 0x12 directly.
+          // Works in both base and PM variant — true whenever the sensor
+          // is physically connected, even if the PM firmware isn't loaded.
+          i2c::ErrorCode pm_err = id(i2c_bus)->write(0x12, nullptr, 0, true);
+          id(pm_addon_present) = (pm_err == i2c::ERROR_OK);
 
 
 # ============================================================================
@@ -1277,4 +1305,15 @@ binary_sensor:
       bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
       bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
       bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
-      return !(scd_ok && sht_ok && bmp_ok && voc_ok);
+      return !(scd_ok && sht_ok && bmp_ok && voc_ok) || id(extra_fault);
+
+  # Always present in both firmware variants. Updated via I2C probe (0x12)
+  # on boot and every 30s — true whenever the PMSA003I is physically connected,
+  # regardless of which firmware variant is running.
+  - platform: template
+    name: "Particle Sensor Addon Found"
+    id: pm_sensor_present
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(pm_addon_present);
+

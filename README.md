@@ -1,6 +1,6 @@
 # Air Quality Sensor
 
-A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https://documentation.espressif.com/esp32-c3-wroom-02_datasheet_en.pdf), featuring a custom 4-layer PCB with four Sensirion/Bosch sensors, a laser-cut glass top panel, and a 3D-printed holder. Firmware runs on [ESPHome](https://esphome.io) and integrates natively with Home Assistant.
+A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https://documentation.espressif.com/esp32-c3-wroom-02_datasheet_en.pdf), featuring a custom 4-layer PCB with four Sensirion/Bosch sensors, a laser-cut glass top panel, and a 3D-printed holder. Firmware runs on [ESPHome](https://esphome.io) and integrates natively with Home Assistant. An optional [PMSA003I particulate matter add-on](#particle-sensor-add-on) connects via the onboard QWIIC connector to add PM1.0, PM2.5, PM10, and EPA AQI measurements.
 
 ![Fusion 360 render](docs/images/air_quality_sensor_fusion360-render.png)
 
@@ -25,6 +25,10 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
   - [Home Assistant entities](#home-assistant-entities)
   - [Web interface](#web-interface)
   - [Diagnostic configs](#diagnostic-configs)
+- [Particle sensor add-on](#particle-sensor-add-on)
+  - [Hardware](#hardware)
+  - [Firmware (PM variant)](#firmware-pm-variant)
+  - [Additional Home Assistant entities](#additional-home-assistant-entities)
 - [Manufacturing](#manufacturing)
 - [License](#license)
 
@@ -38,6 +42,7 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
 | **Sensirion SGP41** | VOC Index (1–500), NOx Index (1–500) | Always active; LED falls back to VOC if CO₂ unavailable | [PDF](https://sensirion.com/media/documents/5FE8673C/61E96F50/Sensirion_Gas_Sensors_Datasheet_SGP41.pdf) |
 | **Sensirion SHT40** | Temperature (±0.2 °C), humidity (±1.8 %RH) | Reference for sensor compensation | [PDF](https://sensirion.com/resource/datasheet/sht4x) |
 | **Bosch BMP280** | Barometric pressure, temperature | CO₂ altitude compensation source | [PDF](https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bmp280-ds001.pdf) |
+| **Plantower PMSA003I** *(optional add-on)* | PM1.0, PM2.5, PM10 (µg/m³), particle counts | Via QWIIC connector; requires PM firmware variant | [PDF](docs/particle_sensor_addon/4505_PMSA003I_series_data_manual_English_V2.6.pdf) |
 
 ---
 
@@ -70,6 +75,10 @@ All sensors on this board are affected by self-heating from the SGP41's MOX elem
 **BMP280 — Barometric pressure**
 
 The BMP280 adds barometric pressure, which has two uses: it feeds the SCD41's ambient pressure compensation input (NDIR CO₂ sensors read differently at different altitudes), and it provides weather-correlation data for the Home Assistant dashboard.
+
+**PMSA003I — Particulate matter (optional add-on)**
+
+The Plantower PMSA003I is a laser scattering particle sensor that measures PM1.0, PM2.5, and PM10 mass concentrations as well as particle counts across six size bins (0.3–10 µm). It connects via the onboard QWIIC connector and is powered from the ESP32's 3.3 V buck rail. The firmware calculates a US EPA AQI from the PM2.5 reading and classifies the likely particle source from the PM2.5/PM10 ratio. See the [Particle sensor add-on](#particle-sensor-add-on) section for setup details.
 
 ---
 
@@ -125,11 +134,12 @@ The board uses a mix of 0402 and 0603 passives, with all ICs in small SMD packag
 
 ### Enclosure
 
-![Full unit assembled](docs/images/unit-assembled.jpg)
+![Sensor on shelf — bedroom](docs/images/sensor-installed-schlafzimmer-shelf.jpg)
+*Sensor on a shelf in the bedroom (base variant, no PM add-on).*
 
 The enclosure consists of three parts:
 
-**3D-printed holder** (`hardware/enclosure/air_quality_sensor_holder.f3d`, `.stl`): holds the PCB and provides ventilation for the sensors. Print in PLA or PETG at 0.2 mm layer height.
+**3D-printed holder** (`hardware/enclosure/air_quality_sensor_holder.f3d`, `.stl`): holds the PCB and provides ventilation for the sensors. Print in PLA or PETG at 0.2 mm layer height. The PM variant uses a modified holder (`hardware/enclosure/particle_sensor_addon/air_quality_sensor_particle_sensor_addon_holder.f3d`, `.stl`) with a mount for the Adafruit PMSA003I breakout. It requires 2 additional M2 heat-set inserts (same type as used for the glass top) and 2 additional M2 screws (same as used for the glass top).
 
 **Laser-cut glass top** (`hardware/enclosure/air_quality_sensor_glass_top.dxf`, `.step`, `.f3d`): 2 mm clear glass, sourced from [Formulor](https://www.formulor.de) using the provided DXF file.
 
@@ -139,13 +149,17 @@ The enclosure consists of three parts:
 
 **Power supply and cable**: 5 V/1 A USB-A wall charger + USB-C to USB-A cable. Any charger rated ≥1 A works. Tested with: [RAVIAD USB-C Kabel 1 m (€3.99)](https://www.amazon.de/gp/product/B0GT379MW7) and [18W USB-A Ladegerät, 4er-Pack (€19.98)](https://www.amazon.de/gp/product/B0CRS1YX4S).
 
+![Sensor installed in living room](docs/images/sensor-installed-wohnzimmer.jpg)
+*Sensor installed in the living room (base variant, no PM add-on) — wall-mounted.*
+
+
 ---
 
 ## Assembly
 
 ### Soldering
 
-All components are SMD. The board was assembled by hand with a soldering iron, flux, and solder paste on the fine-pitch ICs.
+All components are SMD. The board was assembled using solder paste and a hotplate for the initial reflow, followed by hand rework with a soldering iron for touch-ups.
 
 Recommended soldering order — ICs and sensor packages before passives, connectors last:
 
@@ -168,6 +182,7 @@ The schematic PDF (`hardware/pcb/air_quality_sensor/air_quality_sensor-schematic
 | SGP41 | 0x59 | No |
 | SHT40 | 0x44 | No |
 | BMP280 | 0x76 | Via SDIO pin (0x76 or 0x77) |
+| PMSA003I *(PM add-on, optional)* | 0x12 | No |
 
 The firmware enables I2C bus scanning on boot (`scan: true`). With a serial monitor connected, boot log output will list all detected addresses — a quick way to confirm all four sensors are soldered correctly and communicating before flashing the full config.
 
@@ -219,7 +234,7 @@ The firmware is a single [ESPHome](https://esphome.io) YAML configuration. ESPHo
    ./flash.sh Kueche --device 192.168.178.132   # target a known IP for OTA
    ```
 
-   The `location` argument (e.g. `Wohnzimmer`, `Kueche`) is stamped into the device's friendly name in Home Assistant, so multiple boards are distinguishable. The script also derives the firmware version from git — the current tag if HEAD is tagged, otherwise `dev-YYYY-MM-DD`, with `-dirty` appended if there are uncommitted changes.
+   The `location` argument (e.g. `Wohnzimmer`, `Kueche`) is stamped into the device's friendly name in Home Assistant, so multiple boards are distinguishable. The script also derives the firmware version from git — the current tag if HEAD is tagged, otherwise `dev-YYYY-MM-DD`, with `-dirty` appended if there are uncommitted changes, and `-pm` appended for the PM variant (e.g. `v1.1.0-pm`, `v1.1.0-dirty-pm`). This makes the active variant immediately visible in Home Assistant.
 
    For manual invocation without the wrapper:
 
@@ -277,6 +292,7 @@ The device exposes a rich set of entities organized into three tiers in the HA d
 | Comfort Zone | ASHRAE-inspired classification: Comfortable / Acceptable / Too cold / Too hot / Too dry / Too humid |
 | Air Quality LED | RGB light entity — color and pulse controlled by firmware, brightness/on-off by user |
 | Sensor Fault | Binary problem sensor — on if any sensor stops publishing |
+| Particle Sensor Addon Found | Binary connectivity sensor — true if the PMSA003I responds on the I2C bus (probed on boot and every 30s). Present in both variants; also turns true in the base variant if the sensor is plugged in, indicating the PM firmware should be flashed. |
 
 **Controls**
 
@@ -301,6 +317,7 @@ Per-sensor raw values (Temperature SHT40/BMP280/SCD41, Humidity SHT40/SCD41), pe
 The device runs a built-in web server on port 80. Because `name_add_mac_suffix` is enabled, the hostname includes the board's MAC suffix — navigate to `http://air-quality-sensor-XXXXXX.local` (the exact hostname is printed in the ESPHome boot log) or use the device's IP address directly. Any browser on the same network works.
 
 ![Web interface](docs/images/web-interface.png)
+*Base variant — the PM add-on entities are not shown.*
 
 Diagnostic buttons available in the web UI and in Home Assistant:
 
@@ -329,6 +346,74 @@ Flash a diagnostic config the same way as the main config:
 ```bash
 esphome run firmware/diagnostic-scd41-only.yaml
 ```
+
+---
+
+## Particle sensor add-on
+
+The QWIIC connector on the board exposes the I2C bus, allowing an [Adafruit PMSA003I Air Quality Breakout](https://www.adafruit.com/product/4632) to be connected without any soldering. This add-on extends the sensor with PM1.0, PM2.5, and PM10 mass concentration measurements, EPA AQI calculation, and particle source classification.
+
+The PM variant is a separate firmware build that includes the base firmware plus an additional package. Both variants expose a **Particle Sensor Addon Found** binary sensor — it reflects whether the PMSA003I responds on the I2C bus, so even the base firmware turns it true if the sensor is plugged in, making it clear that the PM variant should be flashed.
+
+![Particle sensor add-on — Fusion 360 render](docs/images/air_quality_sensor_particle_sensor_addon_fusion360-render.png)
+
+### Hardware
+
+Connect the Adafruit PMSA003I breakout to the board's QWIIC connector with a QWIIC cable — a 50 mm cable fits cleanly. No other wiring is needed; the breakout is powered and communicates entirely over the 4-pin QWIIC connector (3.3 V, GND, SDA, SCL). The PMSA003I appears at I2C address **0x12**.
+
+The PMSA003I sensor module has mounting holes intended to screw it down to the breakout PCB, but Adafruit doesn't include screws — the module is only held by its connector pads, which isn't particularly solid. Double-sided tape between the module and the breakout PCB fixes this. The two remaining mounting holes on the breakout are used to screw the whole assembly to the holder.
+
+**LED mod (recommended)**
+
+The Adafruit PMSA003I breakout has a status LED that competes visually with the air quality LED on the main board — the air quality LED should be the primary indicator. The breakout's status LED resistor (R1) was changed from 10 kΩ to 100 kΩ to dim it significantly. Alternatively, the LED can be desoldered entirely.
+
+![Sensor installed in kitchen with PM add-on](docs/images/sensor-installed-kueche-pm.jpg)
+*Sensor wall-mounted in the kitchen with PMSA003I PM add-on.*
+
+### Firmware (PM variant)
+
+Flash the PM variant using the `--pm` flag:
+
+```bash
+cd firmware
+./flash.sh Schlafzimmer --pm                           # first flash: interactive port selection
+./flash.sh Schlafzimmer --pm --device 192.168.178.132  # OTA to a known IP
+```
+
+When switching between the base and PM variant, the flash script automatically cleans the build cache to avoid PlatformIO errors from stale component objects.
+
+To revert to the base firmware without the PM package:
+
+```bash
+./flash.sh Schlafzimmer --device 192.168.178.132
+```
+
+### Additional Home Assistant entities
+
+All entities below are added when flashing the PM variant. In the PM variant the PMSA003I is a required sensor: if it is missing from the I2C bus or stops reporting data, the fault LED lights up — same behaviour as the onboard sensors.
+
+**Primary**
+
+| Entity | Description |
+|--------|-------------|
+| PM 1.0 | Mass concentration of particles ≤ 1 µm (µg/m³) |
+| PM 2.5 | Mass concentration of particles ≤ 2.5 µm (µg/m³) |
+| PM 10.0 | Mass concentration of particles ≤ 10 µm (µg/m³) |
+| EPA AQI (PM2.5) | US EPA Air Quality Index calculated from PM2.5 (0–500) |
+| EPA AQI Category | Human-readable label: Good / Moderate / Unhealthy for Sensitive Groups / Unhealthy / Very Unhealthy / Hazardous |
+| Air Quality Score (Extended) | Composite score (0–100%) with PM2.5 added at 15% weight; other weights rebalanced: CO₂ 35%, VOC 20%, NOx 15%, temperature/humidity comfort 7.5% each |
+| Particle Source | Classification from PM2.5/PM10 ratio: Combustion (cooking / candles / traffic) / Mixed / Coarse (dust / pollen / abrasion) |
+
+**Diagnostics**
+
+| Entity | Description |
+|--------|-------------|
+| PMC >0.3 µm | Particle count per 0.1 L of air for particles > 0.3 µm |
+| PMC >0.5 µm | Particle count per 0.1 L of air for particles > 0.5 µm |
+| PMC >1.0 µm | Particle count per 0.1 L of air for particles > 1.0 µm |
+| PMC >2.5 µm | Particle count per 0.1 L of air for particles > 2.5 µm |
+| PMC >5.0 µm | Particle count per 0.1 L of air for particles > 5.0 µm |
+| PMC >10.0 µm | Particle count per 0.1 L of air for particles > 10.0 µm |
 
 ---
 

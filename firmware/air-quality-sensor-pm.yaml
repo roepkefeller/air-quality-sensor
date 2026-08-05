@@ -1,0 +1,17 @@
+# ============================================================================
+# Air Quality Sensor — PM variant
+# ============================================================================
+#
+# Extends the base firmware with PMSA003I particulate matter support via
+# the QWIIC connector. Flash with:
+#
+#   ./flash.sh Schlafzimmer --pm
+#   ./flash.sh Schlafzimmer --pm --device 192.168.178.132
+#
+# All base firmware behaviour (CO2, VOC, NOx, T/H, LED, thresholds, boost
+# mode, diagnostics) is unchanged. The PM package adds on top.
+# ============================================================================
+
+packages:
+  base: !include air-quality-sensor.yaml
+  pm:   !include packages/pm-sensor.yaml
