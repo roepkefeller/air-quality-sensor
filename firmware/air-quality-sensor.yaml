@@ -259,7 +259,7 @@ globals:
   - id: peak_rh_max
     type: float
     restore_value: false
-    initial_value: '0.0'
+    initial_value: '-100.0'
   - id: peak_rh_min
     type: float
     restore_value: false
@@ -976,7 +976,7 @@ sensor:
     accuracy_decimals: 1
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(peak_rh_max);'
+    lambda: 'return id(peak_rh_max) > -50.0f ? id(peak_rh_max) : NAN;'
   - platform: template
     name: "Peak Humidity Min"
     unit_of_measurement: "%"
@@ -1309,7 +1309,7 @@ button:
           id(peak_nox)      = 0.0f;
           id(peak_temp_max) = -100.0f;
           id(peak_temp_min) = 100.0f;
-          id(peak_rh_max)   = 0.0f;
+          id(peak_rh_max)   = -100.0f;
           id(peak_rh_min)   = 100.0f;
           ESP_LOGI("peak", "Peak values reset");
 
@@ -1499,15 +1499,19 @@ interval:
             float v = id(nox_index).state;
             if (!isnan(v) && v > id(peak_nox)) id(peak_nox) = v;
           }
-          if (id(sht40_temperature).has_state()) {
-            float v = id(sht40_temperature).state;
+          // Track the consolidated entities, not raw SHT40. These peaks sit
+          // next to "Temperature" and "Humidity" in HA, so they have to be
+          // peaks OF those — previously they came from a single raw sensor
+          // that might have been dropped from the fusion for drifting.
+          if (id(temperature_main).has_state()) {
+            float v = id(temperature_main).state;
             if (!isnan(v)) {
               if (v > id(peak_temp_max)) id(peak_temp_max) = v;
               if (v < id(peak_temp_min)) id(peak_temp_min) = v;
             }
           }
-          if (id(sht40_humidity).has_state()) {
-            float v = id(sht40_humidity).state;
+          if (id(humidity_main).has_state()) {
+            float v = id(humidity_main).state;
             if (!isnan(v)) {
               if (v > id(peak_rh_max)) id(peak_rh_max) = v;
               if (v < id(peak_rh_min)) id(peak_rh_min) = v;
