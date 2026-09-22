@@ -191,9 +191,12 @@ time:
         minutes: 0
         hours: 0
         then:
-          - globals.set: { id: time_green,  value: '0' }
-          - globals.set: { id: time_yellow, value: '0' }
-          - globals.set: { id: time_red,    value: '0' }
+          - globals.set: { id: time_green,       value: '0' }
+          - globals.set: { id: time_yellow,      value: '0' }
+          - globals.set: { id: time_red,         value: '0' }
+          - globals.set: { id: time_green_live,  value: '0' }
+          - globals.set: { id: time_yellow_live, value: '0' }
+          - globals.set: { id: time_red_live,    value: '0' }
 
 
 # ----------------------------------------------------------------------------
@@ -263,7 +266,17 @@ globals:
     initial_value: '100.0'
 
   # --- Daily air quality time counters (seconds) ---
-  # Persisted so a mid-day reboot doesn't lose the day's data.
+  # Split into a persisted base and a live accumulator, for flash endurance.
+  #
+  # These used to be a single set of restore_value globals incremented once a
+  # second. ESPHome flushes dirty preferences on its own timer (default 60s),
+  # so that meant ~1440 NVS writes a day, every day, forever — and it dragged
+  # every other preference (brightness, thresholds) into each of those writes.
+  #
+  # Now the 1s tick only touches the non-persisted *_live accumulators, and a
+  # 15-minute interval folds them into the persisted base. ~96 writes a day
+  # instead of ~1440, and a crash costs at most 15 minutes of counter.
+  # The displayed sensors report base + live, so nothing looks different.
   - id: time_green
     type: uint32_t
     restore_value: true
@@ -275,6 +288,18 @@ globals:
   - id: time_red
     type: uint32_t
     restore_value: true
+    initial_value: '0'
+  - id: time_green_live
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: time_yellow_live
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: time_red_live
+    type: uint32_t
+    restore_value: false
     initial_value: '0'
 
   # --- Extra fault contribution from optional packages ---
@@ -977,21 +1002,21 @@ sensor:
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_green) / 60.0f;'
+    lambda: 'return (id(time_green) + id(time_green_live)) / 60.0f;'
   - platform: template
     name: "Time Yellow Today"
     unit_of_measurement: "min"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_yellow) / 60.0f;'
+    lambda: 'return (id(time_yellow) + id(time_yellow_live)) / 60.0f;'
   - platform: template
     name: "Time Red Today"
     unit_of_measurement: "min"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_red) / 60.0f;'
+    lambda: 'return (id(time_red) + id(time_red_live)) / 60.0f;'
 
   # --- Boot / uptime counters ---
   - platform: template
@@ -1430,9 +1455,18 @@ interval:
           float v  = id(co2_value).state;
           float ty = id(threshold_co2_yellow).state;
           float tr = id(threshold_co2_red).state;
-          if      (v < ty) { id(time_green)  += 1; }
-          else if (v < tr) { id(time_yellow) += 1; }
-          else             { id(time_red)    += 1; }
+          if      (v < ty) { id(time_green_live)  += 1; }
+          else if (v < tr) { id(time_yellow_live) += 1; }
+          else             { id(time_red_live)    += 1; }
+
+  # Fold the live counters into the persisted base. See the globals section
+  # for why this is not done every second.
+  - interval: 15min
+    then:
+      - lambda: |-
+          id(time_green)  += id(time_green_live);   id(time_green_live)  = 0;
+          id(time_yellow) += id(time_yellow_live);  id(time_yellow_live) = 0;
+          id(time_red)    += id(time_red_live);     id(time_red_live)    = 0;
 
   # Peak value tracking. Every 10s is fast enough to catch transients
   # without hammering the globals every second.
