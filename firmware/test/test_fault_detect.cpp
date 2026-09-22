@@ -15,7 +15,6 @@
 #include "../fault_detect.h"
 
 #include <cstdio>
-#include <cstring>
 #include <string>
 
 static int g_failures = 0;
@@ -53,8 +52,21 @@ static float wob(int i, float amp) {
   return amp * seq[i % 7] / 5.0f;
 }
 
-// Everything alive, the usual case.
-static const bool ALL_ALIVE[aqs::SIG_COUNT] = {true, true, true, true, true, true};
+// Stage a reading the way the firmware does: a NaN means "no valid state".
+static void obs(uint8_t sig, float v) { aqs::observe(sig, !std::isnan(v), v); }
+
+// A full set of healthy, moving readings for the four onboard chips. Scenarios
+// call this and then override whatever they are actually testing. Signals that
+// are never observed count as offline — which is the point, so a scenario
+// cannot accidentally assert on a channel it forgot to feed.
+static void feed_healthy(int i) {
+  obs(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
+  obs(aqs::SIG_BMP280_T, 22.65f + wob(i + 1, 0.06f));
+  obs(aqs::SIG_BMP280_P, 1013.2f + wob(i + 3, 0.20f));
+  obs(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.08f));
+  obs(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
+  obs(aqs::SIG_SGP41_VOC, 100.0f);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -65,11 +77,9 @@ static void test_field_freeze_is_caught() {
   scenario("field freeze (BMP280 latch-up, peers healthy)");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.08f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.8530464172363f);
-    aqs::push(aqs::SIG_BMP280_P, 1016.51080322266f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.8530464172363f);
+    obs(aqs::SIG_BMP280_P, 1016.51080322266f);
     aqs::tick();
 
     // Nothing may fire during the 20-minute boot grace.
@@ -83,7 +93,7 @@ static void test_field_freeze_is_caught() {
   CHECK(!aqs::stuck(aqs::SIG_SCD41_T));
   CHECK(!aqs::stuck(aqs::SIG_SCD41_CO2));
 
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(r.any());
   CHECK(r.chip_faulted(aqs::CHIP_BMP280));
   CHECK(!r.chip_faulted(aqs::CHIP_SHT40));
@@ -102,11 +112,7 @@ static void test_detection_latency_after_grace() {
   scenario("detection latency once armed");
 
   for (int i = 0; i < 60; i++) {  // everything healthy, grace expires
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.08f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 22.65f + wob(i + 1, 0.06f));
-    aqs::push(aqs::SIG_BMP280_P, 1013.2f + wob(i + 3, 0.20f));
+    feed_healthy(i);
     aqs::tick();
   }
   CHECK(!aqs::stuck(aqs::SIG_BMP280_T));
@@ -115,11 +121,9 @@ static void test_detection_latency_after_grace() {
   // span collapses below threshold: 30 ticks == 15 min at the 30 s cadence.
   int caught_at = -1;
   for (int i = 60; i < 100; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.08f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 22.6500000f);
-    aqs::push(aqs::SIG_BMP280_P, 1013.2000000f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 22.6500000f);
+    obs(aqs::SIG_BMP280_P, 1013.2000000f);
     aqs::tick();
     if (aqs::stuck(aqs::SIG_BMP280_T) && caught_at < 0)
       caught_at = i - 60 + 1;
@@ -135,11 +139,12 @@ static void test_quiet_room_no_false_positive() {
   scenario("dead-still room (all flat, dithering, no peer moving)");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 21.00f + wob(i, 0.005f));
-    aqs::push(aqs::SIG_SCD41_T, 21.10f + wob(i + 1, 0.005f));
-    aqs::push(aqs::SIG_SCD41_CO2, 500.0f + wob(i + 2, 0.4f));
-    aqs::push(aqs::SIG_BMP280_T, 21.05f + wob(i + 3, 0.005f));
-    aqs::push(aqs::SIG_BMP280_P, 1013.0f + wob(i + 4, 0.010f));
+    obs(aqs::SIG_SHT40_T, 21.00f + wob(i, 0.005f));
+    obs(aqs::SIG_SCD41_T, 21.10f + wob(i + 1, 0.005f));
+    obs(aqs::SIG_SCD41_CO2, 500.0f + wob(i + 2, 0.4f));
+    obs(aqs::SIG_BMP280_T, 21.05f + wob(i + 3, 0.005f));
+    obs(aqs::SIG_BMP280_P, 1013.0f + wob(i + 4, 0.010f));
+    obs(aqs::SIG_SGP41_VOC, 100.0f);
     aqs::tick();
   }
 
@@ -147,7 +152,7 @@ static void test_quiet_room_no_false_positive() {
     CHECK(!aqs::stuck(s));
     CHECK(!aqs::frozen_exact(s));
   }
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(!r.any());
   CHECK_STR(r.describe(), "OK");
 }
@@ -159,11 +164,12 @@ static void test_bus_wide_latchup() {
   scenario("bus-wide latch-up (every signal bit-identical, no peer moving)");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 21.0f);
-    aqs::push(aqs::SIG_SCD41_T, 21.1f);
-    aqs::push(aqs::SIG_SCD41_CO2, 500.0f);
-    aqs::push(aqs::SIG_BMP280_T, 21.05f);
-    aqs::push(aqs::SIG_BMP280_P, 1013.0f);
+    obs(aqs::SIG_SHT40_T, 21.0f);
+    obs(aqs::SIG_SCD41_T, 21.1f);
+    obs(aqs::SIG_SCD41_CO2, 500.0f);
+    obs(aqs::SIG_BMP280_T, 21.05f);
+    obs(aqs::SIG_BMP280_P, 1013.0f);
+    obs(aqs::SIG_SGP41_VOC, 100.0f);
     aqs::tick();
   }
 
@@ -174,7 +180,7 @@ static void test_bus_wide_latchup() {
   CHECK(aqs::stuck(aqs::SIG_SCD41_CO2));
   CHECK(!aqs::stuck(aqs::SIG_SGP41_VOC));  // liveness only, always exempt
 
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(r.any());
   CHECK_STR(r.describe(),
             "SHT40 frozen (temperature); "
@@ -187,11 +193,11 @@ static void test_frozen_rule_respects_boot_grace() {
   scenario("frozen rule still honours boot grace");
 
   for (int i = 0; i < aqs::ARM_AFTER_SAMPLES - 1; i++) {
-    aqs::push(aqs::SIG_BMP280_P, 1016.51f);
+    obs(aqs::SIG_BMP280_P, 1016.51f);
     aqs::tick();
     CHECK(!aqs::stuck(aqs::SIG_BMP280_P));
   }
-  aqs::push(aqs::SIG_BMP280_P, 1016.51f);
+  obs(aqs::SIG_BMP280_P, 1016.51f);
   aqs::tick();
   CHECK(aqs::stuck(aqs::SIG_BMP280_P));
 }
@@ -203,17 +209,15 @@ static void test_boot_grace() {
 
   CHECK(!aqs::armed());
   for (int i = 0; i < aqs::ARM_AFTER_SAMPLES - 1; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.08f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
-    aqs::push(aqs::SIG_BMP280_P, 1016.51f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.85f);
+    obs(aqs::SIG_BMP280_P, 1016.51f);
     aqs::tick();
     CHECK(!aqs::armed());
     CHECK(!aqs::stuck(aqs::SIG_BMP280_T));
   }
-  aqs::push(aqs::SIG_SHT40_T, 22.70f);
-  aqs::push(aqs::SIG_BMP280_T, 19.85f);
+  feed_healthy(0);
+  obs(aqs::SIG_BMP280_T, 19.85f);
   aqs::tick();
   CHECK(aqs::armed());
 }
@@ -224,29 +228,26 @@ static void test_data_gap_restarts_window() {
   scenario("data gap restarts the window");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.85f);
     aqs::tick();
   }
   CHECK(aqs::stuck(aqs::SIG_BMP280_T));
 
   // One NaN wipes the window; it needs another full 30 ticks to re-accuse.
-  aqs::push(aqs::SIG_BMP280_T, NAN);
+  obs(aqs::SIG_BMP280_T, NAN);
   aqs::tick();
   CHECK(!aqs::stuck(aqs::SIG_BMP280_T));
   CHECK(std::isnan(aqs::span_or_nan(aqs::SIG_BMP280_T)));
 
   for (int i = 0; i < aqs::WINDOW_SLOTS - 1; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.85f);
     aqs::tick();
     CHECK(!aqs::stuck(aqs::SIG_BMP280_T));
   }
-  aqs::push(aqs::SIG_SHT40_T, 22.75f);
-  aqs::push(aqs::SIG_SCD41_CO2, 660.0f);
-  aqs::push(aqs::SIG_BMP280_T, 19.85f);
+  feed_healthy(99);
+  obs(aqs::SIG_BMP280_T, 19.85f);
   aqs::tick();
   CHECK(aqs::stuck(aqs::SIG_BMP280_T));
 }
@@ -258,16 +259,16 @@ static void test_voc_index_never_stuck() {
   scenario("SGP41 VOC index is liveness-only");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SGP41_VOC, 100.0f);
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
+    feed_healthy(i);
+    obs(aqs::SIG_SGP41_VOC, 100.0f);
+    obs(aqs::SIG_BMP280_T, 19.85f);
     aqs::tick();
   }
   CHECK(!aqs::stuck(aqs::SIG_SGP41_VOC));
   CHECK(!aqs::signal_moving(aqs::SIG_SGP41_VOC));
   CHECK(!aqs::signal_flat(aqs::SIG_SGP41_VOC));
 
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(!r.chip_faulted(aqs::CHIP_SGP41));
 }
 
@@ -277,19 +278,19 @@ static void test_dead_beats_stuck() {
   scenario("dead signal reports offline, not stuck");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
-    aqs::push(aqs::SIG_BMP280_P, 1016.51f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.85f);
+    obs(aqs::SIG_BMP280_P, 1016.51f);
     aqs::tick();
   }
   CHECK(aqs::stuck(aqs::SIG_BMP280_P));
 
-  bool alive[aqs::SIG_COUNT];
-  memcpy(alive, ALL_ALIVE, sizeof(alive));
-  alive[aqs::SIG_BMP280_P] = false;  // pressure channel drops off the bus
+  feed_healthy(61);
+  obs(aqs::SIG_BMP280_T, 19.85f);
+  obs(aqs::SIG_BMP280_P, NAN);  // pressure channel drops off the bus
+  aqs::tick();
 
-  const aqs::Report &r = aqs::evaluate(alive, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(r.dead[aqs::SIG_BMP280_P]);
   CHECK(!r.stuck[aqs::SIG_BMP280_P]);
   CHECK(r.stuck[aqs::SIG_BMP280_T]);
@@ -302,22 +303,18 @@ static void test_recovery_clears_fault() {
   scenario("recovery clears the fault");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 19.85f);
-    aqs::push(aqs::SIG_BMP280_P, 1016.51f);
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_T, 19.85f);
+    obs(aqs::SIG_BMP280_P, 1016.51f);
     aqs::tick();
   }
-  CHECK(aqs::evaluate(ALL_ALIVE, false).any());
+  CHECK(aqs::evaluate().any());
 
-  for (int i = 0; i < aqs::WINDOW_SLOTS; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.05f));
-    aqs::push(aqs::SIG_SCD41_CO2, 650.0f + wob(i + 4, 25.0f));
-    aqs::push(aqs::SIG_BMP280_T, 22.65f + wob(i + 1, 0.06f));
-    aqs::push(aqs::SIG_BMP280_P, 1013.2f + wob(i + 3, 0.20f));
+  for (int i = 0; i < aqs::WINDOW_SLOTS; i++) {  // chip comes back
+    feed_healthy(i);
     aqs::tick();
   }
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(!r.any());
   CHECK_STR(r.describe(), "OK");
 }
@@ -327,8 +324,10 @@ static void test_recovery_clears_fault() {
 static void test_drift_reporting() {
   scenario("drift faults are reported per chip and clear again");
 
+  feed_healthy(0);
+  aqs::tick();
   aqs::set_drift(aqs::CHIP_BMP280, true, -2.9f);
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r = aqs::evaluate();
   CHECK(r.any());
   CHECK(r.chip_faulted(aqs::CHIP_BMP280));
   CHECK(aqs::drifting(aqs::CHIP_BMP280));
@@ -336,21 +335,91 @@ static void test_drift_reporting() {
   CHECK(aqs::chip_health(aqs::CHIP_BMP280) == 50.0f);
 
   aqs::set_drift(aqs::CHIP_BMP280, false, 0.0f);
-  const aqs::Report &r2 = aqs::evaluate(ALL_ALIVE, false);
+  const aqs::Report &r2 = aqs::evaluate();
   CHECK(!r2.any());
   CHECK_STR(r2.describe(), "OK");
 }
 
-// The PM package's extra_fault must still reach the aggregate.
-static void test_extra_fault_propagates() {
-  scenario("PM package extra_fault reaches the aggregate");
+// Base firmware: no package ever claims the PMSA003I, so it must stay
+// completely silent even though nothing ever observes its signals.
+static void test_pm_absent_is_silent() {
+  scenario("PM sensor absent (base firmware) stays silent");
 
-  const aqs::Report &r = aqs::evaluate(ALL_ALIVE, true);
+  CHECK(!aqs::installed(aqs::CHIP_PMSA003I));
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    aqs::tick();
+  }
+  const aqs::Report &r = aqs::evaluate();
+  CHECK(!r.any());
+  CHECK(!r.chip_faulted(aqs::CHIP_PMSA003I));
+  CHECK(!r.dead[aqs::SIG_PM_2_5]);
+  CHECK(std::isnan(aqs::chip_health(aqs::CHIP_PMSA003I)));
+  CHECK_STR(r.describe(), "OK");
+}
+
+// PM variant: the package claims the chip, so a missing sensor is a fault on
+// equal terms with the onboard ones — no separate boolean, no separate path.
+static void test_pm_missing_is_a_fault() {
+  scenario("PM sensor claimed but not reporting");
+
+  aqs::set_installed(aqs::CHIP_PMSA003I, true);
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    obs(aqs::SIG_PM_2_5, NAN);
+    obs(aqs::SIG_PM_COUNT_0_3, NAN);
+    aqs::tick();
+  }
+  const aqs::Report &r = aqs::evaluate();
   CHECK(r.any());
-  CHECK_STR(r.describe(), "PM sensor fault");
-  // ...but it is not attributed to any of the onboard chips.
-  for (uint8_t c = 0; c < aqs::CHIP_COUNT; c++)
-    CHECK(!r.chip_faulted(c));
+  CHECK(r.chip_faulted(aqs::CHIP_PMSA003I));
+  CHECK(aqs::chip_health(aqs::CHIP_PMSA003I) == 0.0f);
+  CHECK_STR(r.describe(), "PMSA003I offline (PM2.5+0.3µm count)");
+}
+
+// Clean air: PM2.5 sits at exactly 0.0 µg/m³ for hours. That is healthy, and
+// must never be read as stuck — while the particle count underneath it still
+// moves, proving the sensor is alive.
+static void test_pm_zero_mass_is_healthy() {
+  scenario("PM2.5 pinned at 0.0 in clean air is healthy");
+
+  aqs::set_installed(aqs::CHIP_PMSA003I, true);
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    obs(aqs::SIG_PM_2_5, 0.0f);                          // bit-identical
+    obs(aqs::SIG_PM_COUNT_0_3, 820.0f + wob(i, 40.0f));  // but counts move
+    aqs::tick();
+  }
+  CHECK(!aqs::stuck(aqs::SIG_PM_2_5));
+  CHECK(!aqs::signal_moving(aqs::SIG_PM_2_5));  // liveness only, never a peer
+  const aqs::Report &r = aqs::evaluate();
+  CHECK(!r.any());
+  CHECK_STR(r.describe(), "OK");
+}
+
+// A wedged PMSA003I keeps serving the same frame. PM2.5 cannot tell us that
+// (0 is a legal value), but the 0.3 µm count going bit-identical can.
+static void test_pm_frozen_frame_is_caught() {
+  scenario("PM sensor serving a stale frame");
+
+  aqs::set_installed(aqs::CHIP_PMSA003I, true);
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    obs(aqs::SIG_PM_2_5, 7.0f);
+    obs(aqs::SIG_PM_COUNT_0_3, 1204.0f);  // frozen frame
+    aqs::tick();
+  }
+  CHECK(aqs::stuck(aqs::SIG_PM_COUNT_0_3));
+  CHECK(aqs::stuck_exact(aqs::SIG_PM_COUNT_0_3));
+  CHECK(!aqs::stuck(aqs::SIG_PM_2_5));
+  const aqs::Report &r = aqs::evaluate();
+  CHECK(r.any());
+  CHECK(r.chip_faulted(aqs::CHIP_PMSA003I));
+  CHECK(aqs::chip_health(aqs::CHIP_PMSA003I) == 50.0f);
+  CHECK_STR(r.describe(), "PMSA003I frozen (0.3µm count)");
+  // The onboard chips stay clean — the fault is addressable, not global.
+  CHECK(!r.chip_faulted(aqs::CHIP_SHT40));
+  CHECK(!r.chip_faulted(aqs::CHIP_SCD41));
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +437,9 @@ static void test_sensitivity_quiet_reference_noisy_peer() {
   scenario("SENSITIVITY: quiet SHT40 next to a noisy SCD41");
 
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.004f));   // span 0.008 °C
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.15f));  // span 0.30 °C
-    aqs::push(aqs::SIG_BMP280_T, 22.65f + wob(i + 1, 0.06f));
+    feed_healthy(i);
+    obs(aqs::SIG_SHT40_T, 22.70f + wob(i, 0.004f));     // span 0.008 °C
+    obs(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.15f));  // span 0.30 °C
     aqs::tick();
   }
   printf("        SHT40 span %.4f °C (threshold %.4f) -> stuck=%d exact=%d\n",
@@ -379,13 +448,13 @@ static void test_sensitivity_quiet_reference_noisy_peer() {
   CHECK(aqs::stuck(aqs::SIG_SHT40_T));        // <-- a false positive of the FLAT rule
   CHECK(!aqs::stuck_exact(aqs::SIG_SHT40_T));  // ...but never of the frozen rule
   // Which is why the two are reported with different words:
-  CHECK_STR(aqs::evaluate(ALL_ALIVE, false).describe(), "SHT40 flat (temperature)");
+  CHECK_STR(aqs::evaluate().describe(), "SHT40 flat (temperature)");
 
   // The bit-identical case is the one that is never ambiguous:
   aqs::state() = aqs::State();
   for (int i = 0; i < 60; i++) {
-    aqs::push(aqs::SIG_SHT40_T, 22.70f);
-    aqs::push(aqs::SIG_SCD41_T, 22.80f + wob(i + 2, 0.15f));
+    feed_healthy(i);
+    obs(aqs::SIG_SHT40_T, 22.70f);
     aqs::tick();
   }
   CHECK(aqs::span_or_nan(aqs::SIG_SHT40_T) == 0.0f);
@@ -404,7 +473,10 @@ int main() {
   test_dead_beats_stuck();
   test_recovery_clears_fault();
   test_drift_reporting();
-  test_extra_fault_propagates();
+  test_pm_absent_is_silent();
+  test_pm_missing_is_a_fault();
+  test_pm_zero_mass_is_healthy();
+  test_pm_frozen_frame_is_caught();
   test_sensitivity_quiet_reference_noisy_peer();
 
   printf("\n%s (%d failure%s)\n\n", g_failures ? "FAILED" : "all passed",

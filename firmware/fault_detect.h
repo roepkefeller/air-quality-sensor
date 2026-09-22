@@ -79,6 +79,17 @@
 // Report. Both the 30 s fault interval and the "Sensor Fault" binary sensor
 // read that same cached Report, so the two can never disagree — which they
 // could, and did, when each carried its own copy of the condition.
+//
+// Optional chips
+// --------------
+// The cycle is observe() for every signal, then one tick(), then evaluate().
+// Because observe() only stages, an optional package can feed its own signals
+// from its own interval without caring whether it runs before or after the
+// base firmware's; every window still advances exactly once per tick. That is
+// how the PMSA003I participates on equal terms in the PM variant while staying
+// completely silent in the base firmware, where set_installed() is never
+// called. It replaced an untyped `extra_fault` boolean that could only say
+// "something, somewhere, is wrong".
 // ============================================================================
 
 #include <cmath>
@@ -94,8 +105,26 @@ enum Chip : uint8_t {
   CHIP_BMP280,
   CHIP_SCD41,
   CHIP_SGP41,
+  CHIP_PMSA003I,  // optional add-on, only present in the PM variant
   CHIP_COUNT,
 };
+
+// A chip marked optional starts out NOT installed and reports nothing at all
+// until a package calls set_installed(). That is what lets the base firmware
+// share this header with the PM variant without inventing a PM fault on a
+// board that has no PM sensor.
+struct ChipSpec {
+  const char *label;
+  bool optional;
+};
+
+inline const ChipSpec &chip_spec(uint8_t chip) {
+  static const ChipSpec C[CHIP_COUNT] = {
+      {"SHT40", false}, {"BMP280", false},   {"SCD41", false},
+      {"SGP41", false}, {"PMSA003I", true},
+  };
+  return C[chip];
+}
 
 // --- Signals ----------------------------------------------------------------
 // One entry per independently-freezable channel. The BMP280's temperature and
@@ -108,6 +137,8 @@ enum Signal : uint8_t {
   SIG_SCD41_T,
   SIG_SCD41_CO2,
   SIG_SGP41_VOC,
+  SIG_PM_2_5,
+  SIG_PM_COUNT_0_3,
   SIG_COUNT,
 };
 
@@ -146,14 +177,19 @@ inline const SignalSpec &spec(uint8_t sig) {
       {"temperature", CHIP_SCD41, 0.02f},
       {"CO2", CHIP_SCD41, 2.00f},
       {"VOC index", CHIP_SGP41, -1.00f},  // liveness only, see header comment
+      // PM2.5 mass concentration legitimately reads 0.0 µg/m³ in clean air for
+      // hours on end, so flat says nothing about its health — liveness only.
+      {"PM2.5", CHIP_PMSA003I, -1.00f},
+      // The 0.3 µm particle count is the opposite: indoor air always carries
+      // thousands of them per 0.1 L and the number moves on every single read.
+      // Bit-identical counts mean the sensor is serving a stale frame. Set to
+      // 0 so ONLY the frozen rule applies — no threshold to get wrong.
+      {"0.3µm count", CHIP_PMSA003I, 0.00f},
   };
   return S[sig];
 }
 
-inline const char *chip_label(uint8_t chip) {
-  static const char *const N[CHIP_COUNT] = {"SHT40", "BMP280", "SCD41", "SGP41"};
-  return N[chip];
-}
+inline const char *chip_label(uint8_t chip) { return chip_spec(chip).label; }
 
 // --- Report -----------------------------------------------------------------
 // A snapshot of every fault dimension, addressable per chip and per signal so
@@ -165,7 +201,6 @@ struct Report {
   bool stuck_exact[SIG_COUNT];     // of those, the bit-identical ones
   bool drift[CHIP_COUNT];          // disagrees with consensus, excluded from fusion
   float drift_amount[CHIP_COUNT];  // signed °C offset from consensus
-  bool extra;                      // extra_fault global (PM package)
 
   bool chip_faulted(uint8_t chip) const {
     if (drift[chip])
@@ -177,8 +212,6 @@ struct Report {
   }
 
   bool any() const {
-    if (extra)
-      return true;
     for (uint8_t c = 0; c < CHIP_COUNT; c++)
       if (chip_faulted(c))
         return true;
@@ -232,11 +265,6 @@ struct Report {
         out += part;
       }
     }
-    if (extra) {
-      if (!out.empty())
-        out += "; ";
-      out += "PM sensor fault";
-    }
     if (out.empty())
       out = valid ? "OK" : "starting up";
     return out;
@@ -252,24 +280,55 @@ struct Window {
 
 struct State {
   Window win[SIG_COUNT];
-  uint16_t samples;                // saturating tick count since boot
+  uint16_t samples;  // saturating tick count since boot
+  // Staged by observe(), committed by tick(). Staging rather than pushing
+  // directly is what makes the model extensible: an optional package feeds its
+  // own signals from its own interval, and every window still advances exactly
+  // once per tick no matter who called observe() when, or in what order.
+  bool alive[SIG_COUNT];
+  float pending[SIG_COUNT];
+  bool installed[CHIP_COUNT];
   bool stuck[SIG_COUNT];
   bool stuck_exact[SIG_COUNT];
   bool drift[CHIP_COUNT];
   float drift_amount[CHIP_COUNT];
   Report last;
+  bool ready;
 };
 
 // Zero-initialised at static-init time: empty windows, no faults, valid=false.
+// Non-optional chips are installed on first touch; optional ones wait for a
+// package to claim them.
 inline State &state() {
   static State s;
+  if (!s.ready) {
+    s.ready = true;
+    for (uint8_t c = 0; c < CHIP_COUNT; c++)
+      s.installed[c] = !chip_spec(c).optional;
+  }
   return s;
 }
 
+// Claim an optional chip. Idempotent — call it from the owning package's
+// interval and it costs nothing.
+inline void set_installed(uint8_t chip, bool yes) { state().installed[chip] = yes; }
+inline bool installed(uint8_t chip) { return state().installed[chip]; }
+
 // --- Sampling ---------------------------------------------------------------
 
-// Feed one signal. A NaN restarts the window: a gap in the data means the
-// samples either side of it are not 15 contiguous minutes any more.
+// Report the current reading of one signal. Callers stage every signal they
+// own, then exactly one caller runs tick() to commit them.
+inline void observe(uint8_t sig, bool alive, float value) {
+  State &s = state();
+  s.alive[sig] = alive;
+  s.pending[sig] = alive ? value : NAN;
+}
+
+inline bool alive(uint8_t sig) { return state().alive[sig]; }
+
+// Commit one staged reading into its window. A NaN restarts the window: a gap
+// in the data means the samples either side of it are not 15 contiguous
+// minutes any more.
 inline void push(uint8_t sig, float value) {
   Window &w = state().win[sig];
   if (std::isnan(value)) {
@@ -350,11 +409,14 @@ inline bool peer_moving(uint8_t sig) {
 
 inline bool armed() { return state().samples >= ARM_AFTER_SAMPLES; }
 
-// Call once per sampling tick, after pushing every signal.
+// Call once per sampling tick, after every signal has been observed. Commits
+// the staged readings and re-decides what is stuck.
 inline void tick() {
   State &s = state();
   if (s.samples < 0xFFFFu)
     s.samples++;
+  for (uint8_t i = 0; i < SIG_COUNT; i++)
+    push(i, s.alive[i] ? s.pending[i] : NAN);
   for (uint8_t i = 0; i < SIG_COUNT; i++) {
     // Frozen stands on its own; flat needs a moving peer to be meaningful.
     bool frozen = armed() && frozen_exact(i);
@@ -378,22 +440,23 @@ inline bool stuck(uint8_t sig) { return state().stuck[sig]; }
 inline bool stuck_exact(uint8_t sig) { return state().stuck_exact[sig]; }
 
 // --- Evaluation -------------------------------------------------------------
-// `alive` is indexed by Signal: has_state() && !isnan(state) for each channel.
-// Caches the result so every consumer sees one identical verdict.
-inline const Report &evaluate(const bool alive[SIG_COUNT], bool extra) {
+// Builds the verdict from the liveness staged by observe() plus the stuck and
+// drift state. Caches it so every consumer sees one identical answer.
+// Signals belonging to an uninstalled optional chip report nothing.
+inline const Report &evaluate() {
   State &s = state();
   Report &r = s.last;
   r.valid = true;
-  r.extra = extra;
   for (uint8_t i = 0; i < SIG_COUNT; i++) {
-    r.dead[i] = !alive[i];
+    bool on = s.installed[spec(i).chip];
+    r.dead[i] = on && !s.alive[i];
     // A dead signal is reported dead, not stuck — its window is empty anyway.
-    r.stuck[i] = s.stuck[i] && alive[i];
-    r.stuck_exact[i] = s.stuck_exact[i] && alive[i];
+    r.stuck[i] = on && s.stuck[i] && s.alive[i];
+    r.stuck_exact[i] = on && s.stuck_exact[i] && s.alive[i];
   }
   for (uint8_t c = 0; c < CHIP_COUNT; c++) {
-    r.drift[c] = s.drift[c];
-    r.drift_amount[c] = s.drift_amount[c];
+    r.drift[c] = s.installed[c] && s.drift[c];
+    r.drift_amount[c] = r.drift[c] ? s.drift_amount[c] : 0.0f;
   }
   return r;
 }
@@ -405,6 +468,8 @@ inline const Report &cached() { return state().last; }
 //    50 — still publishing, but frozen (stuck) or drifting out of consensus
 //     0 — at least one of the chip's channels has no data at all
 inline float chip_health(uint8_t chip) {
+  if (!installed(chip))
+    return NAN;  // optional chip that is not part of this build
   const Report &r = cached();
   for (uint8_t i = 0; i < SIG_COUNT; i++)
     if (spec(i).chip == chip && r.dead[i])

@@ -302,14 +302,6 @@ globals:
     restore_value: false
     initial_value: '0'
 
-  # --- Extra fault contribution from optional packages ---
-  # Stays false in base firmware. The PM package sets this true whenever
-  # PM2.5 has no valid reading — covers both missing on I2C and not reporting.
-  - id: extra_fault
-    type: bool
-    restore_value: false
-    initial_value: 'false'
-
   # --- PM sensor addon presence ---
   # Probed via raw I2C write to 0x12 on boot and every 30s.
   # True whenever the PMSA003I responds on the bus, regardless of which
@@ -1533,37 +1525,43 @@ interval:
   - interval: ${fault_sample_interval}
     then:
       - lambda: |-
-          // --- Liveness, per channel ---
-          // BMP280 temperature and pressure are checked separately: they are
+          // --- Stage every channel this firmware owns ---
+          // BMP280 temperature and pressure are staged separately: they are
           // independent ADC paths and either can freeze on its own. The old
-          // code only ever looked at pressure.
-          bool alive[aqs::SIG_COUNT];
-          alive[aqs::SIG_SHT40_T]   = id(sht40_temperature).has_state()  && !isnan(id(sht40_temperature).state);
-          alive[aqs::SIG_BMP280_T]  = id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state);
-          alive[aqs::SIG_BMP280_P]  = id(bmp280_pressure).has_state()    && !isnan(id(bmp280_pressure).state);
-          alive[aqs::SIG_SCD41_T]   = id(scd41_temperature).has_state()  && !isnan(id(scd41_temperature).state);
-          alive[aqs::SIG_SCD41_CO2] = id(co2_value).has_state()          && !isnan(id(co2_value).state);
-          alive[aqs::SIG_SGP41_VOC] = id(voc_index).has_state()          && !isnan(id(voc_index).state);
+          // code only ever looked at pressure. The SGP41 VOC index is staged
+          // for liveness but never stuck-checked — it parks on exactly 100 in
+          // clean stable air, so "flat" is its healthy state.
+          aqs::observe(aqs::SIG_SHT40_T,
+                       id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state),
+                       id(sht40_temperature).state);
+          aqs::observe(aqs::SIG_SCD41_T,
+                       id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state),
+                       id(scd41_temperature).state);
+          aqs::observe(aqs::SIG_SCD41_CO2,
+                       id(co2_value).has_state() && !isnan(id(co2_value).state),
+                       id(co2_value).state);
+          aqs::observe(aqs::SIG_SGP41_VOC,
+                       id(voc_index).has_state() && !isnan(id(voc_index).state),
+                       id(voc_index).state);
 
-          // --- Feed the stuck-detection windows ---
-          // The SGP41 VOC index is liveness-only and deliberately not sampled;
-          // it parks on exactly 100 in clean stable air, so "flat" is healthy.
-          float bmp_t = alive[aqs::SIG_BMP280_T] ? id(bmp280_temperature).state : NAN;
-          float bmp_p = alive[aqs::SIG_BMP280_P] ? id(bmp280_pressure).state    : NAN;
+          bool bmp_t_ok = id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state);
+          bool bmp_p_ok = id(bmp280_pressure).has_state()    && !isnan(id(bmp280_pressure).state);
+          float bmp_t = id(bmp280_temperature).state;
+          float bmp_p = id(bmp280_pressure).state;
           if (id(debug_freeze_bmp)) {   // "Debug Freeze BMP280" switch
             bmp_t = id(debug_freeze_bmp_t);
             bmp_p = id(debug_freeze_bmp_p);
+            bmp_t_ok = bmp_p_ok = true;
           }
+          aqs::observe(aqs::SIG_BMP280_T, bmp_t_ok, bmp_t);
+          aqs::observe(aqs::SIG_BMP280_P, bmp_p_ok, bmp_p);
 
-          aqs::push(aqs::SIG_SHT40_T,   alive[aqs::SIG_SHT40_T]   ? id(sht40_temperature).state  : NAN);
-          aqs::push(aqs::SIG_BMP280_T,  bmp_t);
-          aqs::push(aqs::SIG_BMP280_P,  bmp_p);
-          aqs::push(aqs::SIG_SCD41_T,   alive[aqs::SIG_SCD41_T]   ? id(scd41_temperature).state  : NAN);
-          aqs::push(aqs::SIG_SCD41_CO2, alive[aqs::SIG_SCD41_CO2] ? id(co2_value).state          : NAN);
+          // --- Commit and decide ---
+          // Optional packages stage their own signals from their own interval;
+          // tick() commits whatever is staged, so ordering between the two does
+          // not matter. One verdict, cached and shared.
           aqs::tick();
-
-          // --- One verdict, cached and shared ---
-          const aqs::Report &rep = aqs::evaluate(alive, id(extra_fault));
+          const aqs::Report &rep = aqs::evaluate();
           bool is_fault = rep.any();
           if (is_fault) ESP_LOGW("fault", "%s", rep.describe().c_str());
 
