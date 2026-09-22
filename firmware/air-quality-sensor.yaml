@@ -114,9 +114,17 @@ esphome:
   # carrying its own copy of the condition.
   includes:
     - fault_detect.h
+    - reset_reason.h
   on_boot:
-    priority: -100
-    then:
+    # Priority 200 runs before components are set up, so the reset reason is
+    # in place before the text sensor first publishes.
+    - priority: 200
+      then:
+        - lambda: |-
+            id(last_crash_reason) = aqs::reset_reason_string();
+            ESP_LOGI("boot", "Reset reason: %s", id(last_crash_reason).c_str());
+    - priority: -100
+      then:
       - delay: 5s
       - globals.set:
           id: led_ready
@@ -310,10 +318,12 @@ globals:
     type: uint32_t
     restore_value: true
     initial_value: '0'
+  # Written on every boot from esp_reset_reason(). No longer persisted: it
+  # describes the CURRENT boot, and it is always set before anything reads it.
   - id: last_crash_reason
     type: std::string
-    restore_value: true
-    initial_value: '"None"'
+    restore_value: false
+    initial_value: '"Unknown"'
 
 
 # ----------------------------------------------------------------------------
@@ -1055,11 +1065,13 @@ text_sensor:
                days, hours, minutes, (unsigned) id(reboot_count));
       return {std::string(buf)};
 
-  # Placeholder for future ESP32 crash-reason capture. Populated on next
-  # boot after a crash if we wire in an esp32.crash reader (not yet done).
+  # Why this boot happened, straight from esp_reset_reason(). Decisive for
+  # this board: a latched-up sensor survives a software reset and only clears
+  # on a real power cycle, so "did it actually lose power?" is the first
+  # question whenever a chip does or does not come back. See reset_reason.h.
   - platform: template
-    name: "Last Crash Reason"
-    icon: "mdi:alert-circle-outline"
+    name: "Last Reset Reason"
+    icon: "mdi:restart-alert"
     entity_category: diagnostic
     update_interval: 300s
     lambda: |-
