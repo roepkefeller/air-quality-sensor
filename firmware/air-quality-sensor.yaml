@@ -76,9 +76,20 @@
 # `location` differentiates devices sharing this firmware in Home Assistant.
 # `firmware_version` is stamped by the flash.sh wrapper from git state; the
 # "dev" default only appears if someone runs `esphome run` directly.
+# `fault_sample_interval` is the stuck detector's sampling cadence. The window
+# length and boot grace in fault_detect.h are counted in TICKS, not seconds, so
+# shortening this shortens both proportionally:
+#
+#   30s (default) → 15 min window, 20 min boot grace   [production]
+#    2s           →  1 min window,  80 s  boot grace   [testing]
+#
+# So a full stuck-detection test cycle takes ~100 s instead of ~35 min:
+#
+#   esphome -s location Test -s fault_sample_interval 2s run air-quality-sensor.yaml
 substitutions:
   location: "Default"
   firmware_version: "dev"
+  fault_sample_interval: "30s"
 
 
 # ----------------------------------------------------------------------------
@@ -276,6 +287,24 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  # --- Stuck-detection test harness ---
+  # Set by the "Debug Freeze BMP280" switch. While true, the fault interval
+  # feeds the detector the BMP280 values captured at the moment the switch was
+  # flipped instead of the live ones — simulating exactly the latch-up that
+  # motivated this whole fault model, without waiting for one to happen.
+  - id: debug_freeze_bmp
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: debug_freeze_bmp_t
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: debug_freeze_bmp_p
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+
   # --- Diagnostics ---
   - id: reboot_count
     type: uint32_t
@@ -432,6 +461,41 @@ switch:
           id(sgp41_sensor).stop_poller();
           id(sgp41_sensor).set_update_interval(30000);
           id(sgp41_sensor).start_poller();
+
+  # --------------------------------------------------------------------------
+  # Stuck-detection test harness
+  # --------------------------------------------------------------------------
+  # Freezes the BMP280 values *as seen by the stuck detector* at whatever they
+  # read when the switch was flipped. The sensor itself keeps publishing
+  # normally, so this isolates the stuck path: it proves the detector, the
+  # per-chip binary sensor, the Fault Detail string and the fault LED all fire,
+  # end to end, on a real board.
+  #
+  # Expect the fault after one full window of frozen samples — 15 min at the
+  # default cadence, or ~1 min if flashed with `-s fault_sample_interval 2s`.
+  # Switching it off clears the fault one window later.
+  #
+  # Same philosophy as the "Test Fault LED" button: verifying the alarm path
+  # should not require waiting for a real failure.
+  - platform: template
+    name: "Debug Freeze BMP280"
+    id: debug_freeze_bmp_switch
+    icon: "mdi:snowflake"
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: |-
+          id(debug_freeze_bmp_t) = id(bmp280_temperature).state;
+          id(debug_freeze_bmp_p) = id(bmp280_pressure).state;
+          id(debug_freeze_bmp) = true;
+          ESP_LOGW("debug", "BMP280 freeze simulation ON — detector pinned to "
+                            "T=%.6f C P=%.6f hPa",
+                   id(debug_freeze_bmp_t), id(debug_freeze_bmp_p));
+    turn_off_action:
+      - lambda: |-
+          id(debug_freeze_bmp) = false;
+          ESP_LOGW("debug", "BMP280 freeze simulation OFF");
 
 
 # ============================================================================
@@ -1403,7 +1467,7 @@ interval:
   # We drive the fault LED directly here instead of relying on the
   # binary_sensor's on_state trigger, which would only fire on transitions —
   # not while the state persists.
-  - interval: 30s
+  - interval: ${fault_sample_interval}
     then:
       - lambda: |-
           // --- Liveness, per channel ---
@@ -1421,9 +1485,16 @@ interval:
           // --- Feed the stuck-detection windows ---
           // The SGP41 VOC index is liveness-only and deliberately not sampled;
           // it parks on exactly 100 in clean stable air, so "flat" is healthy.
+          float bmp_t = alive[aqs::SIG_BMP280_T] ? id(bmp280_temperature).state : NAN;
+          float bmp_p = alive[aqs::SIG_BMP280_P] ? id(bmp280_pressure).state    : NAN;
+          if (id(debug_freeze_bmp)) {   // "Debug Freeze BMP280" switch
+            bmp_t = id(debug_freeze_bmp_t);
+            bmp_p = id(debug_freeze_bmp_p);
+          }
+
           aqs::push(aqs::SIG_SHT40_T,   alive[aqs::SIG_SHT40_T]   ? id(sht40_temperature).state  : NAN);
-          aqs::push(aqs::SIG_BMP280_T,  alive[aqs::SIG_BMP280_T]  ? id(bmp280_temperature).state : NAN);
-          aqs::push(aqs::SIG_BMP280_P,  alive[aqs::SIG_BMP280_P]  ? id(bmp280_pressure).state    : NAN);
+          aqs::push(aqs::SIG_BMP280_T,  bmp_t);
+          aqs::push(aqs::SIG_BMP280_P,  bmp_p);
           aqs::push(aqs::SIG_SCD41_T,   alive[aqs::SIG_SCD41_T]   ? id(scd41_temperature).state  : NAN);
           aqs::push(aqs::SIG_SCD41_CO2, alive[aqs::SIG_SCD41_CO2] ? id(co2_value).state          : NAN);
           aqs::tick();
