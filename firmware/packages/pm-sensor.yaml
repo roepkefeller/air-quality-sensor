@@ -88,6 +88,18 @@ sensor:
       accuracy_decimals: 0
 
   # --------------------------------------------------------------------------
+  # PM watchdog counter — minutes since last valid PM2.5 reading.
+  # Resets to 0 when the sensor reports. Reboots at 10.
+  - platform: template
+    name: "PM Missing Ticks"
+    id: pm_missing_ticks_sensor
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: "mdi:timer-alert-outline"
+    update_interval: 60s
+    lambda: 'return id(pm_missing_ticks);'
+
+  # --------------------------------------------------------------------------
   # US EPA AQI from PM2.5
   # --------------------------------------------------------------------------
   # Calculated using the official EPA linear interpolation formula across
@@ -176,17 +188,42 @@ sensor:
 
 
 # ----------------------------------------------------------------------------
-# Fault detection — contributes to base firmware's fault LED
+# Fault detection + I2C lockup watchdog
 # ----------------------------------------------------------------------------
 # In the PM variant the PMSA003I is required. extra_fault = true whenever
 # PM2.5 has no valid reading — this covers both "not found on I2C bus" and
 # "found but not reporting data".
+#
+# The PMSA003I occasionally locks up the I2C bus (holds SDA low) without
+# disappearing from the I2C scan. The watchdog reboots after 10 minutes of
+# missing readings — the ESP-IDF bus recovery on boot reliably clears it.
+# 10 min is long enough to not fire on normal boot (sensor reports within 30s).
+globals:
+  - id: pm_missing_ticks
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+
 interval:
   - interval: 30s
     then:
       - lambda: |-
           bool pm_ok = id(pm_2_5).has_state() && !isnan(id(pm_2_5).state);
           id(extra_fault) = !pm_ok;
+
+  - interval: 1min
+    then:
+      - lambda: |-
+          bool pm_ok = id(pm_2_5).has_state() && !isnan(id(pm_2_5).state);
+          if (pm_ok) {
+            id(pm_missing_ticks) = 0;
+          } else {
+            id(pm_missing_ticks) += 1;
+            if (id(pm_missing_ticks) >= 10) {
+              ESP_LOGW("pm_watchdog", "PM sensor missing for 10 min, rebooting to recover I2C bus");
+              App.safe_reboot();
+            }
+          }
 
 
 # ----------------------------------------------------------------------------
