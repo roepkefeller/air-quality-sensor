@@ -453,12 +453,22 @@ number:
 # ----------------------------------------------------------------------------
 # Boost mode
 # ----------------------------------------------------------------------------
-# A HA switch that flips all four sensors from 30s update intervals down
-# to 5s for fast feedback (e.g. while cooking). Restores 30s when off.
+# A HA switch that flips the sensors from 30s update intervals down to 5s for
+# fast feedback (e.g. while cooking). Restores 30s when off.
+#
+# It re-polls the DERIVED template sensors too, not just the four hardware
+# pollers. Boost used to only speed up the raw chips, which left the entities
+# people actually look at — Temperature, Humidity, Absolute Humidity, Dew
+# Point, Air Quality Score — sitting at 30s. Pressing "Boost" made the LED and
+# CO2 responsive while the displayed temperature stayed sluggish.
 #
 # Important: uses stop_poller/start_poller instead of call_setup — the
 # latter re-runs the sensor's chip-level init (including new I2C setup
 # commands) which reliably wedges the SCD41 and SGP41.
+#
+# Not re-polled: the stuck detector's own interval, which stays at 30s by
+# design (see fault_sample_interval), and the PM package's sensors, which the
+# base firmware cannot reference.
 switch:
   - platform: template
     name: "Boost Mode"
@@ -468,34 +478,14 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - logger.log: "Boost mode ON — 5s intervals"
-      - lambda: |-
-          id(sht40_sensor).stop_poller();
-          id(sht40_sensor).set_update_interval(5000);
-          id(sht40_sensor).start_poller();
-          id(bmp280_sensor).stop_poller();
-          id(bmp280_sensor).set_update_interval(5000);
-          id(bmp280_sensor).start_poller();
-          id(scd41_sensor).stop_poller();
-          id(scd41_sensor).set_update_interval(5000);
-          id(scd41_sensor).start_poller();
-          id(sgp41_sensor).stop_poller();
-          id(sgp41_sensor).set_update_interval(5000);
-          id(sgp41_sensor).start_poller();
+      - script.execute:
+          id: apply_update_interval
+          interval_ms: 5000
     turn_off_action:
       - logger.log: "Boost mode OFF — back to 30s intervals"
-      - lambda: |-
-          id(sht40_sensor).stop_poller();
-          id(sht40_sensor).set_update_interval(30000);
-          id(sht40_sensor).start_poller();
-          id(bmp280_sensor).stop_poller();
-          id(bmp280_sensor).set_update_interval(30000);
-          id(bmp280_sensor).start_poller();
-          id(scd41_sensor).stop_poller();
-          id(scd41_sensor).set_update_interval(30000);
-          id(scd41_sensor).start_poller();
-          id(sgp41_sensor).stop_poller();
-          id(sgp41_sensor).set_update_interval(30000);
-          id(sgp41_sensor).start_poller();
+      - script.execute:
+          id: apply_update_interval
+          interval_ms: 30000
 
   # --------------------------------------------------------------------------
   # Stuck-detection test harness
@@ -1354,6 +1344,29 @@ button:
 #     both CO2 and VOC arrive back-to-back.
 # ============================================================================
 script:
+  # Re-poll every measurement component at a new cadence. Single definition so
+  # the on and off paths of Boost Mode cannot drift apart.
+  - id: apply_update_interval
+    parameters:
+      interval_ms: int
+    then:
+      - lambda: |-
+          for (auto *c : {
+                 (PollingComponent *) id(sht40_sensor),
+                 (PollingComponent *) id(bmp280_sensor),
+                 (PollingComponent *) id(scd41_sensor),
+                 (PollingComponent *) id(sgp41_sensor),
+                 (PollingComponent *) id(temperature_main),
+                 (PollingComponent *) id(humidity_main),
+                 (PollingComponent *) id(absolute_humidity),
+                 (PollingComponent *) id(dew_point),
+                 (PollingComponent *) id(air_quality_score),
+               }) {
+            c->stop_poller();
+            c->set_update_interval((uint32_t) interval_ms);
+            c->start_poller();
+          }
+
   - id: update_air_quality_led
     then:
       - lambda: |-
