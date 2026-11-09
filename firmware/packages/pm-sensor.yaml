@@ -28,7 +28,8 @@ sensor:
   # PMSA003I — mass concentration + particle counts
   # --------------------------------------------------------------------------
   # I2C address 0x12. If the sensor is not on the bus all sub-sensors remain
-  # without state ("unavailable" in HA), and extra_fault is raised.
+  # without state ("unavailable" in HA) and the fault model reports the chip
+  # offline, exactly as it does for the four onboard sensors.
   - platform: pmsa003i
     id: pmsa003i_sensor
     address: 0x12
@@ -58,6 +59,7 @@ sensor:
     # analysis (e.g. fine/coarse ratio, aerosol fingerprinting).
     pmc_0_3:
       name: "PMC >0.3µm"
+      id: pmc_0_3
       entity_category: diagnostic
       state_class: measurement
       accuracy_decimals: 0
@@ -86,6 +88,43 @@ sensor:
       entity_category: diagnostic
       state_class: measurement
       accuracy_decimals: 0
+
+  # --------------------------------------------------------------------------
+  # Fault-model diagnostics, mirroring the onboard sensors' entities.
+  - platform: template
+    name: "PMSA003I Health"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::chip_health(aqs::CHIP_PMSA003I);'
+
+  # The quantity the frozen rule watches. A live sensor moves this on every
+  # read; a stale frame pins it to exactly 0.000.
+  - platform: template
+    name: "Span PM 0.3µm Count"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_PM_COUNT_0_3);'
+
+  # How long the PM chip has been faulted, and how much of the recovery budget
+  # has been spent. Both reset themselves when the sensor comes back.
+  - platform: template
+    name: "PM Fault Minutes"
+    id: pm_fault_minutes_sensor
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: "mdi:timer-alert-outline"
+    update_interval: 60s
+    lambda: 'return id(pm_fault_minutes);'
+  - platform: template
+    name: "PM Recovery Attempts"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: "mdi:restart-alert"
+    update_interval: 60s
+    lambda: 'return id(pm_recovery_attempts);'
 
   # --------------------------------------------------------------------------
   # US EPA AQI from PM2.5
@@ -176,17 +215,103 @@ sensor:
 
 
 # ----------------------------------------------------------------------------
-# Fault detection — contributes to base firmware's fault LED
+# Fault detection + I2C lockup watchdog
 # ----------------------------------------------------------------------------
-# In the PM variant the PMSA003I is required. extra_fault = true whenever
-# PM2.5 has no valid reading — this covers both "not found on I2C bus" and
-# "found but not reporting data".
+# In the PM variant the PMSA003I is a required sensor, so it registers with the
+# shared fault model (fault_detect.h) as a first-class chip rather than through
+# a separate boolean. That buys it everything the onboard sensors get: a
+# per-chip fault entity, a health percentage, a named entry in Fault Detail,
+# and stuck detection — not just "is it publishing".
+#
+# Two signals are staged, for opposite reasons:
+#
+#   PM2.5        liveness only. Mass concentration legitimately reads exactly
+#                0.0 µg/m³ for hours in clean air, so flat says nothing.
+#   0.3µm count  frozen rule only. Indoor air always carries thousands of
+#                these per 0.1 L and the number moves on every single read, so
+#                bit-identical counts mean the sensor is serving a stale frame.
+#                This is the case PM2.5 alone cannot see: a wedged sensor that
+#                still answers on the bus with the last frame it ever built.
+#
+# The chip is claimed here and nowhere else, which is why the base firmware —
+# same header, no PM sensor — never invents a PM fault.
+#
+# ---- Watchdog ----
+# The PMSA003I occasionally locks up the I2C bus (holds SDA low) without
+# disappearing from the I2C scan. Rebooting runs the ESP-IDF bus recovery on
+# boot, which clears that. It now triggers on the fault model's verdict, so a
+# sensor stuck on a stale frame is recovered too, not just a silent one.
+#
+# The attempt budget is the important part. pm_fault_minutes does not survive a
+# reboot, so an unbudgeted watchdog would reboot every 10 minutes forever the
+# moment the sensor was genuinely gone — unplug the add-on and the board would
+# never stay up. pm_recovery_attempts IS persisted, capping recovery at 3 tries
+# (~30 min) before it gives up and just reports the fault. Both reset the
+# instant the sensor comes back, so a later lockup gets a fresh budget.
+#
+# A reboot cannot fix a true latch-up, only a power cycle can. "Last Reset
+# Reason" distinguishes the two after the fact.
+globals:
+  - id: pm_fault_minutes
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: pm_recovery_attempts
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+
 interval:
+  # Stage the PM signals for the shared fault model. The base firmware's
+  # interval calls tick(); staging here means the order of the two does not
+  # matter, at worst the PM reading lands one cycle later.
   - interval: 30s
     then:
       - lambda: |-
-          bool pm_ok = id(pm_2_5).has_state() && !isnan(id(pm_2_5).state);
-          id(extra_fault) = !pm_ok;
+          aqs::set_installed(aqs::CHIP_PMSA003I, true);
+          aqs::observe(aqs::SIG_PM_2_5,
+                       id(pm_2_5).has_state() && !isnan(id(pm_2_5).state),
+                       id(pm_2_5).state);
+          aqs::observe(aqs::SIG_PM_COUNT_0_3,
+                       id(pmc_0_3).has_state() && !isnan(id(pmc_0_3).state),
+                       id(pmc_0_3).state);
+
+  - interval: 1min
+    then:
+      - lambda: |-
+          if (!aqs::cached().chip_faulted(aqs::CHIP_PMSA003I)) {
+            id(pm_fault_minutes) = 0;
+            id(pm_recovery_attempts) = 0;
+            return;
+          }
+          if (id(pm_fault_minutes) < 255) id(pm_fault_minutes) += 1;
+          if (id(pm_fault_minutes) < 10) return;
+
+          if (id(pm_recovery_attempts) >= 3) {
+            ESP_LOGW("pm_watchdog",
+                     "PM sensor faulted for %u min, recovery budget spent "
+                     "(%u reboots) — leaving the fault standing",
+                     id(pm_fault_minutes), id(pm_recovery_attempts));
+            return;
+          }
+          id(pm_recovery_attempts) += 1;
+          ESP_LOGW("pm_watchdog",
+                   "PM sensor faulted for 10 min (%s), reboot %u/3 to recover "
+                   "the I2C bus",
+                   aqs::cached().describe().c_str(), id(pm_recovery_attempts));
+          App.safe_reboot();
+
+
+# ----------------------------------------------------------------------------
+# Fault entity — the PM chip, addressable like any onboard sensor
+# ----------------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "PMSA003I Fault"
+    id: fault_pmsa003i
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return aqs::cached().chip_faulted(aqs::CHIP_PMSA003I);'
 
 
 # ----------------------------------------------------------------------------
