@@ -49,8 +49,10 @@ republishes an older tag; HA then offers it as an update.
 
 ## Setting up the update server (once)
 
-1. Proxmox: create a Debian 12 LXC (unprivileged, 2 cores, 2 GB RAM, 16 GB
-   disk), hostname `aqs-firmware`, DHCP on the LAN bridge.
+1. Proxmox: create a Debian/Ubuntu LXC (unprivileged, nesting on, 2 cores,
+   1.5 GB RAM + 1 GB swap, 16 GB disk), hostname `aqs-firmware`, DHCP on
+   the LAN bridge. Current install: CT 106 on `pve`, Ubuntu 24.04,
+   192.168.178.151.
 2. Inside the container, as root:
    ```bash
    apt-get update && apt-get install -y curl
@@ -68,7 +70,11 @@ names DHCP clients `<hostname>.fritz.box`). If your boards resolve DNS
 elsewhere (e.g. AdGuard without forwarding to the Fritzbox), give the LXC a
 fixed IP and set `update_server` in `firmware/air-quality-sensor.yaml`.
 
-Logs: `journalctl -u aqs-release-watcher -e`
+Logs: `journalctl -u aqs-release-watcher -e`. Builds take ~6 min per board
+the first time (ESP-IDF), ~2 min afterwards.
+
+Through `pct exec` the PATH lacks `/usr/local/bin`; call
+`/usr/local/bin/aqs-release-watcher` there.
 
 ## Bootstrap
 
