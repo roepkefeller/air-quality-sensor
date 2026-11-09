@@ -12,7 +12,7 @@ substitutions:
   device_slug: "schlafzimmer"
 
 esphome:
-  build_path: .esphome/build/aqs-schlafzimmer
+  build_path: build/aqs-schlafzimmer
 
 packages:
   firmware: !include air-quality-sensor.yaml

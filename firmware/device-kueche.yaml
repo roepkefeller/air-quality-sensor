@@ -16,7 +16,7 @@ substitutions:
   device_slug: "kueche"
 
 esphome:
-  build_path: .esphome/build/aqs-kueche
+  build_path: build/aqs-kueche
 
 packages:
   firmware: !include air-quality-sensor-pm.yaml
