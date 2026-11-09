@@ -56,3 +56,8 @@ jobs:
       - name: Compile ${{ matrix.device }}
         working-directory: firmware
         run: esphome -s firmware_version ci compile device-${{ matrix.device }}.yaml
+
+      # tools/build-release.sh picks the image up from exactly this path.
+      - name: OTA image present
+        working-directory: firmware
+        run: ls -l .esphome/build/aqs-${{ matrix.device }}/.pioenvs/air-quality-sensor/firmware.ota.bin
