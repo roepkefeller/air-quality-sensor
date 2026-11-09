@@ -51,6 +51,16 @@ git -C "$CHECKOUT" fetch --quiet --force --tags origin
 git -C "$CHECKOUT" checkout --quiet --force "refs/tags/$tag"
 git -C "$CHECKOUT" clean --quiet -fdx -e firmware/.esphome
 
+# Releases from before the OTA setup (≤ v1.1.0) have no build script and no
+# update entity on the boards — nothing to publish. Mark them as handled so
+# the timer doesn't retry every 10 minutes.
+if [ ! -x "$CHECKOUT/tools/build-release.sh" ]; then
+    echo "$tag predates OTA support (no tools/build-release.sh) — skipping"
+    mkdir -p "$(dirname "$STATE")"
+    echo "$tag" > "$STATE"
+    exit 0
+fi
+
 install -m 600 "$SECRETS" "$CHECKOUT/firmware/secrets.yaml"
 
 # Build with the ESPHome version pinned in the tagged tree.
