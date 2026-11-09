@@ -86,9 +86,16 @@
 # So a full stuck-detection test cycle takes ~100 s instead of ~35 min:
 #
 #   esphome -s location Test -s fault_sample_interval 2s run air-quality-sensor.yaml
+#
+# `device_slug` and `update_server` drive the pull-based OTA update entity
+# (see "Firmware updates" below). They're set per board in devices/*.yaml;
+# the defaults here only matter for ad-hoc `flash.sh <Location>` builds,
+# whose manifest URL simply 404s (no update offered).
 substitutions:
   location: "Default"
   firmware_version: "dev"
+  device_slug: "manual"
+  update_server: "http://aqs-firmware.fritz.box"
   fault_sample_interval: "30s"
 
 
@@ -108,6 +115,12 @@ esphome:
   name: air-quality-sensor
   friendly_name: "Air Quality Sensor ${location}"
   name_add_mac_suffix: true
+  # The project version is what the http_request update entity compares
+  # against the manifest's "version" — keep it identical to the string
+  # tools/build-release.sh writes into manifest.json.
+  project:
+    name: "roepkefeller.air-quality-sensor"
+    version: "${firmware_version}"
   # Sensor fault model (liveness + stuck + drift detection). Keeping it in a
   # header rather than inline lambdas means the fault interval and the
   # "Sensor Fault" binary sensor read one shared verdict instead of each
@@ -158,8 +171,36 @@ api:
     key: !secret api_encryption_key
 
 ota:
+  # Push OTA (flash.sh / ESPHome dashboard) — stays as the manual and
+  # recovery path.
   - platform: esphome
     password: !secret ota_password
+  # Pull OTA, used by the "Firmware" update entity below.
+  - platform: http_request
+
+# ----------------------------------------------------------------------------
+# Firmware updates (pull from the home update server)
+# ----------------------------------------------------------------------------
+# Every 6 h the board fetches
+#   ${update_server}/${device_slug}/manifest.json
+# from the update server on the LAN (Proxmox LXC, see docs/ota-server.md).
+# If the manifest version differs from this build's project version, HA
+# shows a regular "Update available" under Settings → Updates. Nothing
+# installs until you click Install there; the MD5 from the manifest is
+# checked before the new image is booted.
+#
+# Each board has its own manifest URL (device_slug), so a board only ever
+# receives the image built for its room and variant (e.g. Kueche + PM).
+# Thresholds, LED brightness etc. live in flash preferences and survive.
+http_request:
+  timeout: 10s
+
+update:
+  - platform: http_request
+    id: firmware_update
+    name: "Firmware"
+    source: "${update_server}/${device_slug}/manifest.json"
+    update_interval: 6h
 
 wifi:
   ssid: !secret wifi_ssid

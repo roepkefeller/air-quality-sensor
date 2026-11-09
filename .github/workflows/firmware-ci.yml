@@ -1,0 +1,58 @@
+# Compiles every board config on GitHub-hosted runners with dummy secrets.
+# Catches YAML/C++ errors before a release reaches the update server.
+# Nothing built here is published — real images are built at home by
+# tools/aqs-release-watcher.sh, because they contain the WiFi credentials.
+name: Firmware CI
+
+on:
+  push:
+    paths: ["firmware/**", "tools/**", ".github/workflows/firmware-ci.yml"]
+  pull_request:
+    paths: ["firmware/**", "tools/**", ".github/workflows/firmware-ci.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [kueche, schlafzimmer, wohnzimmer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/requirements-build.txt
+
+      - name: Install ESPHome (pinned)
+        run: pip install -r tools/requirements-build.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('tools/requirements-build.txt') }}
+
+      - name: Dummy secrets
+        working-directory: firmware
+        run: |
+          cat > secrets.yaml <<EOF
+          wifi_ssid: "ci"
+          wifi_password: "ci-dummy-pass"
+          api_encryption_key: "$(openssl rand -base64 32)"
+          ota_password: "ci"
+          EOF
+
+      - name: Unit tests (fault detector)
+        if: matrix.device == 'kueche'
+        working-directory: firmware/test
+        run: bash run_tests.sh
+
+      - name: Compile ${{ matrix.device }}
+        working-directory: firmware
+        run: esphome -s firmware_version ci compile device-${{ matrix.device }}.yaml

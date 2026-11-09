@@ -242,6 +242,8 @@ The firmware is a single [ESPHome](https://esphome.io) YAML configuration. ESPHo
    esphome -s location "Wohnzimmer" -s firmware_version "dev-manual" run air-quality-sensor.yaml
    ```
 
+3. **Deployed boards: updates via GitHub releases.** Each installed board has a config `firmware/device-<room>.yaml` that pins its location and variant (`./flash.sh kueche` uses it). After the first flash, a GitHub release is built by a small update server on the LAN, and Home Assistant shows it as a normal *Update available* for each board. Setup, release flow and rollback: [docs/ota-server.md](docs/ota-server.md).
+
 3. All subsequent updates are over-the-air automatically.
 
 **Multiple boards:** the firmware is designed to be shared across boards unchanged. `name_add_mac_suffix: true` appends the last 3 bytes of each board's WiFi MAC to its hostname (e.g. `air-quality-sensor-a1b2c3.local`), so boards don't conflict on the network. Only the `location` substitution at flash time differs.

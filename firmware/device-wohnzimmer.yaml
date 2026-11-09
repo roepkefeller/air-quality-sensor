@@ -1,0 +1,18 @@
+# ============================================================================
+# Wohnzimmer — board b7f8b8 — base variant (no particulate sensor)
+# ============================================================================
+# Per-board config: fixes installation location and variant so neither the
+# release build nor a manual flash can mix them up.
+#
+#   ./flash.sh wohnzimmer             # manual push OTA
+#   tools/build-release.sh       # builds all device-*.yaml for the update server
+# ============================================================================
+substitutions:
+  location: "Wohnzimmer"
+  device_slug: "wohnzimmer"
+
+esphome:
+  build_path: .esphome/build/aqs-wohnzimmer
+
+packages:
+  firmware: !include air-quality-sensor.yaml
