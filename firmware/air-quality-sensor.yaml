@@ -232,6 +232,37 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  # --- Last LED state applied by update_air_quality_led ---
+  # Lets the script skip no-op writes. Every perform() does an instant
+  # set_immediately_() that aborts the Critical Pulse fade in progress and
+  # snaps the LED to user_brightness. With CO2 + VOC both triggering the
+  # script that happened every ~15 s (every ~2.5 s in boost mode) and made
+  # the pulse stutter. Sentinels (-1) make the first update after boot apply.
+  - id: led_last_r
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_g
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_b
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_brightness
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: led_last_pulse
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
   # --- Peak observations since boot (reset by "Reset Peak Values" button) ---
   # Initialized to impossible-in-practice values so the first real reading
   # always wins (e.g. temp_min starts at +100°C, not 0, so a 22°C reading
@@ -1413,6 +1444,34 @@ script:
           // --- Apply, preserving user's on/off preference ---
           bool should_pulse = value >= t_pulse;
           bool should_be_on = id(user_wants_led_on);
+
+          // --- Skip no-op writes ---
+          // perform() always does an instant set that aborts a running
+          // Critical Pulse fade (ESPHome drops the repeated set_effect but
+          // still snaps brightness to user_brightness), so only touch the
+          // LED when something we control changed. The light's real on/off
+          // and effect state are checked as well, so a manual change in HA
+          // (e.g. effect set to None) is still corrected on the next
+          // reading. Brightness isn't compared against the live value
+          // because the pulse effect modulates it.
+          auto *led = id(air_quality_led);
+          bool led_matches =
+              led->remote_values.is_on() == should_be_on &&
+              (!should_be_on ||
+               (led->get_effect_name() == "Critical Pulse") == should_pulse);
+          bool changed =
+              r != id(led_last_r) || g != id(led_last_g) || b != id(led_last_b) ||
+              brightness   != id(led_last_brightness) ||
+              should_be_on != id(led_last_on) ||
+              should_pulse != id(led_last_pulse);
+          if (!changed && led_matches) return;
+
+          id(led_last_r) = r;
+          id(led_last_g) = g;
+          id(led_last_b) = b;
+          id(led_last_brightness) = brightness;
+          id(led_last_on)    = should_be_on;
+          id(led_last_pulse) = should_pulse;
 
           if (should_be_on) {
             auto call = id(air_quality_led).turn_on();
