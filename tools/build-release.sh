@@ -10,7 +10,7 @@
 #       https://github.com/roepkefeller/air-quality-sensor/releases/tag/v1.2.0 \
 #       "LED pulse no longer stutters"
 #
-# Normally run by tools/aqs-release-watcher.sh on the update server, from a
+# Normally run by tools/update-server/aqs-release-watcher.sh on the update server, from a
 # checkout of the release tag, with firmware/secrets.yaml in place.
 #
 # Result per board (served by nginx):

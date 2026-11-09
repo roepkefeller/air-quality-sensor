@@ -49,21 +49,36 @@ republishes an older tag; HA then offers it as an update.
 
 ## Setting up the update server (once)
 
-1. Proxmox: create a Debian/Ubuntu LXC (unprivileged, nesting on, 2 cores,
-   1.5 GB RAM + 1 GB swap, 16 GB disk), hostname `aqs-firmware`, DHCP on
-   the LAN bridge. Current install: CT 106 on `pve`, Ubuntu 24.04,
-   192.168.178.151.
+Everything the server runs is in [`tools/update-server/`](../tools/update-server/):
+
+| File | Goes to |
+|------|---------|
+| `create-lxc.sh` | run on the Proxmox host, creates the LXC (same parameters as CT 106) |
+| `setup.sh` | run inside the LXC; installs packages and everything below, idempotent |
+| `aqs-release-watcher.sh` | `/usr/local/bin/aqs-release-watcher` |
+| `aqs-release-watcher.service` / `.timer` | `/etc/systemd/system/` (every 10 min) |
+| `aqs-firmware.nginx.conf` | `/etc/nginx/sites-available/aqs-firmware` |
+
+Only `secrets.yaml` is deliberately not in the repo.
+
+1. On the Proxmox host: `bash tools/update-server/create-lxc.sh`
+   (current install: CT 106 on `pve`, Ubuntu 24.04, 192.168.178.151).
 2. Inside the container, as root:
    ```bash
    apt-get update && apt-get install -y curl
-   bash <(curl -fsSL https://raw.githubusercontent.com/roepkefeller/air-quality-sensor/main/tools/setup-update-server.sh)
+   bash <(curl -fsSL https://raw.githubusercontent.com/roepkefeller/air-quality-sensor/main/tools/update-server/setup.sh)
    ```
+   Before this branch is merged: prefix with `AQS_SETUP_BRANCH=fix/led-pulse-stutter-and-http-ota`
+   and use that branch in the URL.
 3. From the Mac you flash from:
    ```bash
    scp firmware/secrets.yaml root@aqs-firmware.fritz.box:/etc/aqs-firmware/secrets.yaml
    ```
-4. On the server: `aqs-release-watcher` (publishes the latest release now).
+4. On the server: `/usr/local/bin/aqs-release-watcher` (publishes the latest release now).
 5. Check from the LAN: `curl http://aqs-firmware.fritz.box/kueche/manifest.json`
+
+To change the server later, edit the files in `tools/update-server/` and
+re-run `setup.sh` on the server.
 
 The boards reach the server as `http://aqs-firmware.fritz.box` (Fritzbox
 names DHCP clients `<hostname>.fritz.box`). If your boards resolve DNS

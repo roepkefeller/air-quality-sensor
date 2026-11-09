@@ -1,7 +1,7 @@
 # Compiles every board config on GitHub-hosted runners with dummy secrets.
 # Catches YAML/C++ errors before a release reaches the update server.
 # Nothing built here is published — real images are built at home by
-# tools/aqs-release-watcher.sh, because they contain the WiFi credentials.
+# tools/update-server/aqs-release-watcher.sh, because they contain the WiFi credentials.
 name: Firmware CI
 
 on:

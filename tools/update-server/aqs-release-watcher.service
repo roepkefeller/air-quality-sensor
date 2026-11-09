@@ -1,0 +1,11 @@
+[Unit]
+Description=Build and publish air-quality-sensor firmware for new GitHub releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aqs-release-watcher
+# A full build of all boards takes a few minutes on first run (toolchain).
+TimeoutStartSec=45min
+Nice=10
