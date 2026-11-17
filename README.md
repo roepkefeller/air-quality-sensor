@@ -2,6 +2,8 @@
 
 A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https://documentation.espressif.com/esp32-c3-wroom-02_datasheet_en.pdf), featuring a custom 4-layer PCB with four Sensirion/Bosch sensors, a laser-cut glass top panel, and a 3D-printed holder. Firmware runs on [ESPHome](https://esphome.io) and integrates natively with Home Assistant. An optional [PMSA003I particulate matter add-on](#particle-sensor-add-on) connects via the onboard QWIIC connector to add PM1.0, PM2.5, PM10, and EPA AQI measurements.
 
+Installed boards are updated over the air: publishing a GitHub release makes a small [update server](#firmware-updates) on the home network build the firmware for every board, and Home Assistant offers it as a regular *Update available*. A [fault model](#sensor-fault-detection) watches every sensor not just for dropouts but also for frozen and drifting readings.
+
 ![Fusion 360 render](docs/images/air_quality_sensor_fusion360-render.png)
 
 ---
@@ -21,7 +23,9 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
   - [Power-on checklist](#power-on-checklist)
 - [Firmware](#firmware)
   - [Getting started](#getting-started)
+  - [Board configs](#board-configs)
   - [LED behavior](#led-behavior)
+  - [Sensor fault detection](#sensor-fault-detection)
   - [Home Assistant entities](#home-assistant-entities)
   - [Web interface](#web-interface)
   - [Diagnostic configs](#diagnostic-configs)
@@ -29,6 +33,12 @@ A DIY open-source air quality monitor built around an [ESP32-C3-WROOM-02](https:
   - [Hardware](#hardware)
   - [Firmware (PM variant)](#firmware-pm-variant)
   - [Additional Home Assistant entities](#additional-home-assistant-entities)
+- [Firmware updates](#firmware-updates)
+  - [How it works](#how-it-works)
+  - [Releasing a new version](#releasing-a-new-version)
+  - [Update server](#update-server)
+  - [CI](#ci)
+- [Repository layout](#repository-layout)
 - [Manufacturing](#manufacturing)
 - [License](#license)
 
@@ -242,11 +252,39 @@ The firmware is a single [ESPHome](https://esphome.io) YAML configuration. ESPHo
    esphome -s location "Wohnzimmer" -s firmware_version "dev-manual" run air-quality-sensor.yaml
    ```
 
-3. All subsequent updates are over-the-air automatically.
+3. Once a board is installed somewhere for good, give it a [board config](#board-configs) (`firmware/device-<room>.yaml`) and flash it once with `./flash.sh <room>`. From then on it receives [firmware updates](#firmware-updates) from GitHub releases and you install them from Home Assistant — no laptop needed.
 
-**Multiple boards:** the firmware is designed to be shared across boards unchanged. `name_add_mac_suffix: true` appends the last 3 bytes of each board's WiFi MAC to its hostname (e.g. `air-quality-sensor-a1b2c3.local`), so boards don't conflict on the network. Only the `location` substitution at flash time differs.
+**Multiple boards:** the firmware is designed to be shared across boards unchanged. `name_add_mac_suffix: true` appends the last 3 bytes of each board's WiFi MAC to its hostname (e.g. `air-quality-sensor-a1b2c3.local`), so boards don't conflict on the network. Only the location (and, for the kitchen, the PM variant) differs — pinned per board in its board config.
 
 **Home Assistant:** once on the network the device is auto-discovered via the native API. Go to Settings → Integrations and accept the discovered device. All entities appear immediately.
+
+---
+
+### Board configs
+
+Every installed board has a small config file in `firmware/` that fixes its installation location and firmware variant, so neither a release build nor a manual flash can mix them up:
+
+| Board | MAC suffix | Config | Variant | Location (as flashed) |
+|-------|-----------|--------|---------|-----------------------|
+| Küche | b7f8c0 | `device-kueche.yaml` | base + [PM add-on](#particle-sensor-add-on) | `Kueche` |
+| Schlafzimmer | b7f8b0 | `device-schlafzimmer.yaml` | base | `Schlafzimmer` |
+| Wohnzimmer | b7f8b8 | `device-wohnzimmer.yaml` | base | `Wohnzimmer` |
+
+Each file only sets `location`, `device_slug` (the board's folder on the update server) and its own build directory, then includes the base or PM firmware:
+
+```yaml
+substitutions:
+  location: "Kueche"
+  device_slug: "kueche"
+esphome:
+  build_path: build/aqs-kueche
+packages:
+  firmware: !include air-quality-sensor-pm.yaml
+```
+
+`location` becomes part of the device name in Home Assistant, so it must not change once a board is set up (the kitchen board is `Kueche` without umlaut because that's how it was first flashed; its display name was renamed in HA). Settings changed in HA — thresholds, LED brightness, counters — are stored on the board and survive every update.
+
+Flash a board by its config name: `./flash.sh kueche` (optionally `--device <ip>`). **New board:** copy one of the files, set `location` and `device_slug`, flash it once — from then on it updates with the others.
 
 ---
 
@@ -268,7 +306,28 @@ Brightness defaults to 25% on first boot and is then fully user-controlled from 
 
 The LED driver is activated 5 seconds after boot to avoid a crash in the WS2812 driver before its internal buffer is initialized. During this window the LED stays off regardless of sensor data.
 
-A second red LED (the fault LED) lights up whenever any sensor stops reporting valid data. It re-evaluates every 30 seconds as a backstop against sensors going silently missing.
+A second red LED (the fault LED) lights up whenever the [fault model](#sensor-fault-detection) considers any sensor faulty — dead, frozen or drifting. It re-evaluates every 30 seconds.
+
+---
+
+### Sensor fault detection
+
+Checking only whether a sensor still publishes is not enough: in the field a BMP280 latched up and kept publishing the exact same temperature and pressure for 14 days while every liveness check stayed green. The fault model in `firmware/fault_detect.h` therefore treats a sensor as faulty if any of these hold:
+
+| Rule | Condition |
+|------|-----------|
+| **Dead** | no value, or NaN |
+| **Frozen** | every sample over a 15 min window is bit-identical — real sensors always have some ADC noise, so this needs no threshold |
+| **Flat** | the value moves less than a per-signal span over 15 min *while another chip clearly moves* (so a quiet night doesn't trigger it) |
+| **Drift** | a temperature sensor disagrees with the consensus of the others by more than 1.5 °C |
+
+The detector samples every 30 s on its own schedule, so boost mode doesn't shorten the window. Stuck checks only start 20 minutes after boot. Self-calibrating signals that legitimately sit still (SGP41 VOC index, PM2.5 in clean air) are liveness-only; the PM add-on is watched through its 0.3 µm particle count instead, which always moves in real indoor air.
+
+The result is shown as one **Sensor Fault** entity plus one fault entity per chip, a readable **Fault Detail** string (e.g. `SCD41 drift +2.4 °C`) and the fault LED. The **Span** diagnostic sensors show each signal's movement over the window — watch them for a few days before tightening a threshold.
+
+For about 1–2 minutes after every reboot, sensors that haven't reported their first reading yet show up as offline or drifting and the fault LED lights; this clears by itself once all sensors are up.
+
+**Testing the alarm path:** the *Debug Freeze BMP280* switch freezes the BMP280 values as seen by the detector (the sensor itself keeps publishing). After one window (15 min) the BMP280 fault, Fault Detail and fault LED fire end to end; switching it off clears them again. For faster tests flash with `-s fault_sample_interval 2s`. Host-side unit tests for the detector: `firmware/test/run_tests.sh`.
 
 ---
 
@@ -291,7 +350,8 @@ The device exposes a rich set of entities organized into three tiers in the HA d
 | Air Quality Score | Weighted composite: CO₂ 40%, VOC 25%, NOx 15%, temperature comfort 10%, humidity comfort 10% (0–100%) |
 | Comfort Zone | ASHRAE-inspired classification: Comfortable / Acceptable / Too cold / Too hot / Too dry / Too humid |
 | Air Quality LED | RGB light entity — color and pulse controlled by firmware, brightness/on-off by user |
-| Sensor Fault | Binary problem sensor — on if any sensor stops publishing |
+| Sensor Fault | Binary problem sensor — on if any sensor is dead, frozen or drifting (see [Sensor fault detection](#sensor-fault-detection)) |
+| Firmware | Update entity — shows *Update available* when a newer release is on the [update server](#firmware-updates); install from HA |
 | Particle Sensor Addon Found | Binary connectivity sensor — true if the PMSA003I responds on the I2C bus (probed on boot and every 30s). Present in both variants; also turns true in the base variant if the sensor is plugged in, indicating the PM firmware should be flashed. |
 
 **Controls**
@@ -308,7 +368,9 @@ The device exposes a rich set of entities organized into three tiers in the HA d
 
 **Diagnostics** (collapsed by default in HA)
 
-Per-sensor raw values (Temperature SHT40/BMP280/SCD41, Humidity SHT40/SCD41), per-sensor health (0/100%), peak CO₂/VOC/NOx/temperature/humidity since boot, time spent in each air quality category today (minutes), 5V rail voltage, uptime, reboot count, firmware version, temperature/humidity source attribution with drift annotation, last crash reason.
+Per-sensor raw values (Temperature SHT40/BMP280/SCD41, Humidity SHT40/SCD41), per-sensor health (0/100%), per-chip fault binary sensors (SHT40/BMP280/SCD41/SGP41 Fault), Fault Detail, Span sensors for stuck detection, peak CO₂/VOC/NOx/temperature/humidity since boot (taken from the consolidated values), time spent in each air quality category today (minutes), 5V rail voltage, uptime, reboot count, firmware version, temperature/humidity source attribution with drift annotation, last crash reason, last reset reason (power-on, software reset, watchdog, brownout …), and the *Debug Freeze BMP280* test switch.
+
+Boost mode speeds up the derived entities (consolidated temperature/humidity, dew point, Air Quality Score) together with the raw sensors. The daily category counters are written to flash far less often than before (~15× fewer NVS writes).
 
 ---
 
@@ -372,7 +434,7 @@ The Adafruit PMSA003I breakout has a status LED that competes visually with the 
 
 ### Firmware (PM variant)
 
-Flash the PM variant using the `--pm` flag:
+Installed boards get the PM variant through their [board config](#board-configs) (`device-kueche.yaml` includes `air-quality-sensor-pm.yaml`), so `./flash.sh kueche` and release updates always build it with the add-on. For ad-hoc flashing, use the `--pm` flag:
 
 ```bash
 cd firmware
@@ -414,6 +476,92 @@ All entities below are added when flashing the PM variant. In the PM variant the
 | PMC >2.5 µm | Particle count per 0.1 L of air for particles > 2.5 µm |
 | PMC >5.0 µm | Particle count per 0.1 L of air for particles > 5.0 µm |
 | PMC >10.0 µm | Particle count per 0.1 L of air for particles > 10.0 µm |
+| PMSA003I Fault / PMSA003I Health | The add-on as a regular chip in the fault model (liveness of PM2.5, frozen check on the 0.3 µm count) |
+| PM Fault Minutes | How long the PM sensor has been faulted |
+| PM Recovery Attempts | Reboots spent trying to recover it |
+
+**Bus lockup recovery:** the PMSA003I occasionally holds the I2C data line low while still appearing on the bus. When the fault model flags it for 10 minutes, the board reboots, and the I2C bus recovery at boot clears the lockup. This is capped at 3 attempts (persisted across reboots), so a board whose add-on is really missing doesn't reboot forever; the budget resets as soon as the sensor reports again.
+
+---
+
+## Firmware updates
+
+### How it works
+
+```
+GitHub release ──(checked every 10 min)──► update server (Proxmox LXC on the LAN)
+                                            builds every firmware/device-*.yaml
+                                            with the local secrets.yaml
+                                            nginx: /<board>/manifest.json + .ota.bin
+                                                       ▲
+each board checks its own manifest every 6 h ──────────┘
+        └──► Home Assistant: "Firmware" update entity → Settings → Updates → Install
+```
+
+- Each board has a **Firmware** update entity (ESPHome `update` platform `http_request`). It reads `http://aqs-firmware.fritz.box/<device_slug>/manifest.json`; if the version there differs from the installed one, Home Assistant shows *Update available* — titled "Luftqualitätssensor Firmware", with a link to the release — exactly like any other update.
+- **Nothing installs on its own.** Click *Install* in HA; the board downloads the image, checks its MD5 and reboots into it.
+- Because every board only reads its own manifest, the kitchen board can only ever receive the PM build, and no board can receive another room's name.
+- Version strings match what `flash.sh` stamps: `v1.2.0` for base boards, `v1.2.0-pm` for the kitchen.
+- Classic push OTA (`./flash.sh`, ESPHome dashboard, OTA password) keeps working for development and recovery.
+
+### Releasing a new version
+
+1. Merge to `main`.
+2. Create a release on GitHub with a tag like `v1.2.0`. The release title becomes the update summary.
+3. Within ~10 minutes the update server has built and published all boards (a few minutes per board). Home Assistant shows the update the next time the boards check (every 6 h) — or immediately via *Check for updates* / restarting a board.
+
+**Pre-releases** are ignored by the server, so you can tag something without offering it. **Rollback:** on the server, `/usr/local/bin/aqs-release-watcher v1.1.0` republishes an older tag, which HA then offers as an update. The server keeps the last three images per board.
+
+### Update server
+
+Everything the server runs is versioned in [`tools/update-server/`](tools/update-server/) and identical to what's installed:
+
+| File | Purpose |
+|------|---------|
+| `create-lxc.sh` | Creates the LXC on the Proxmox host (2 cores, 1.5 GB RAM + 1 GB swap, 16 GB disk, DHCP) |
+| `setup.sh` | Installs nginx, git, a Python venv with the pinned ESPHome, the watcher and its timer; idempotent, re-run after changes |
+| `aqs-release-watcher.sh` | Checks the latest GitHub release, checks out the tag, runs `tools/build-release.sh`, publishes |
+| `aqs-release-watcher.service` / `.timer` | Runs the watcher every 10 minutes |
+| `aqs-firmware.nginx.conf` | Serves `/srv/aqs-firmware` read-only to the boards |
+
+The build itself is [`tools/build-release.sh`](tools/build-release.sh): it compiles every board config, and only publishes once all of them built — image first, manifest last — so the boards never see a half-finished release. The ESPHome version is pinned in `tools/requirements-build.txt`.
+
+Current install: CT 106 `aqs-firmware` on the Proxmox host, Ubuntu 24.04, `192.168.178.151` / `aqs-firmware.fritz.box`. Rebuilding it from scratch:
+
+```bash
+# on the Proxmox host
+bash tools/update-server/create-lxc.sh
+# inside the new container
+bash <(curl -fsSL https://raw.githubusercontent.com/roepkefeller/air-quality-sensor/main/tools/update-server/setup.sh)
+# from the machine with firmware/secrets.yaml
+scp firmware/secrets.yaml root@aqs-firmware.fritz.box:/etc/aqs-firmware/secrets.yaml
+```
+
+**Why it's built at home:** the firmware images contain the WiFi password, so they're never built or published on GitHub. The server also doesn't use a self-hosted GitHub runner — on a public repo a stranger's pull request could run code on it. It only *pulls* from GitHub; nothing on it is reachable from outside. `secrets.yaml` is the only piece deliberately not in the repo.
+
+Details, troubleshooting and the bootstrap of new boards: [docs/ota-server.md](docs/ota-server.md).
+
+### CI
+
+[`.github/workflows/firmware-ci.yml`](.github/workflows/firmware-ci.yml) compiles all three board configs on every push with dummy secrets, runs the fault-detector unit tests, and checks that the OTA image ends up where the release build expects it. Nothing built there is published.
+
+---
+
+## Repository layout
+
+| Path | Contents |
+|------|----------|
+| `firmware/air-quality-sensor.yaml` | Base firmware (all four onboard sensors) |
+| `firmware/air-quality-sensor-pm.yaml`, `firmware/packages/pm-sensor.yaml` | PM variant (PMSA003I add-on) |
+| `firmware/device-*.yaml` | [Board configs](#board-configs) — one per installed board |
+| `firmware/fault_detect.h`, `firmware/reset_reason.h` | Fault model and reset-reason decoding |
+| `firmware/test/` | Host-side unit tests for the fault model |
+| `firmware/flash.sh` | Manual flashing (USB or push OTA) |
+| `tools/build-release.sh`, `tools/requirements-build.txt` | Release build used by the update server |
+| `tools/update-server/` | Complete [update server](#update-server) configuration |
+| `.github/workflows/` | CI |
+| `hardware/` | PCB (KiCad, Gerbers, BOM) and enclosure |
+| `docs/` | Images, datasheets, [OTA/update-server guide](docs/ota-server.md) |
 
 ---
 

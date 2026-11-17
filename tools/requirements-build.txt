@@ -1,0 +1,3 @@
+# ESPHome version the release builds use. Keep it in step with what you
+# flash by hand, so builds from the update server and from flash.sh match.
+esphome==2026.4.2

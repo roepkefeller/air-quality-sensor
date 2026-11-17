@@ -1,0 +1,22 @@
+# ============================================================================
+# Küche — board b7f8c0 — with PMSA003I particulate sensor (Qwiic)
+# ============================================================================
+# Per-board config: fixes installation location and variant so neither the
+# release build nor a manual flash can mix them up.
+#
+#   ./flash.sh kueche            # manual push OTA
+#   tools/build-release.sh       # builds all device-*.yaml for the update server
+#
+# `location` is "Kueche" (no umlaut) on purpose: that's what the board was
+# originally flashed with; HA's display name "Küche" was renamed in HA and
+# stays as is. Changing it here would rename the device in HA.
+# ============================================================================
+substitutions:
+  location: "Kueche"
+  device_slug: "kueche"
+
+esphome:
+  build_path: build/aqs-kueche
+
+packages:
+  firmware: !include air-quality-sensor-pm.yaml

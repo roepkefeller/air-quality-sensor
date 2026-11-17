@@ -20,7 +20,9 @@
 # * Drives an addressable RGB LED with air quality color (green/yellow/red
 #   based on CO2, VOC fallback if CO2 is unavailable). Pulses above a
 #   configurable critical threshold.
-# * Drives a discrete "fault" LED when any sensor stops publishing.
+# * Drives a discrete "fault" LED when any sensor stops publishing, freezes
+#   on a constant value, or drifts out of consensus with the other chips
+#   (see fault_detect.h for the fault model).
 # * Publishes rich diagnostics (peak values, uptime, reboots, per-sensor
 #   health, 5V rail voltage) into a separate Diagnostic section in HA.
 # * Supports a "boost mode" switch that reduces update intervals to 5s for
@@ -74,9 +76,27 @@
 # `location` differentiates devices sharing this firmware in Home Assistant.
 # `firmware_version` is stamped by the flash.sh wrapper from git state; the
 # "dev" default only appears if someone runs `esphome run` directly.
+# `fault_sample_interval` is the stuck detector's sampling cadence. The window
+# length and boot grace in fault_detect.h are counted in TICKS, not seconds, so
+# shortening this shortens both proportionally:
+#
+#   30s (default) → 15 min window, 20 min boot grace   [production]
+#    2s           →  1 min window,  80 s  boot grace   [testing]
+#
+# So a full stuck-detection test cycle takes ~100 s instead of ~35 min:
+#
+#   esphome -s location Test -s fault_sample_interval 2s run air-quality-sensor.yaml
+#
+# `device_slug` and `update_server` drive the pull-based OTA update entity
+# (see "Firmware updates" below). They're set per board in devices/*.yaml;
+# the defaults here only matter for ad-hoc `flash.sh <Location>` builds,
+# whose manifest URL simply 404s (no update offered).
 substitutions:
   location: "Default"
   firmware_version: "dev"
+  device_slug: "manual"
+  update_server: "http://aqs-firmware.fritz.box"
+  fault_sample_interval: "30s"
 
 
 # ----------------------------------------------------------------------------
@@ -95,9 +115,29 @@ esphome:
   name: air-quality-sensor
   friendly_name: "Air Quality Sensor ${location}"
   name_add_mac_suffix: true
+  # The project version is what the http_request update entity compares
+  # against the manifest's "version" — keep it identical to the string
+  # tools/build-release.sh writes into manifest.json.
+  project:
+    name: "roepkefeller.air-quality-sensor"
+    version: "${firmware_version}"
+  # Sensor fault model (liveness + stuck + drift detection). Keeping it in a
+  # header rather than inline lambdas means the fault interval and the
+  # "Sensor Fault" binary sensor read one shared verdict instead of each
+  # carrying its own copy of the condition.
+  includes:
+    - fault_detect.h
+    - reset_reason.h
   on_boot:
-    priority: -100
-    then:
+    # Priority 200 runs before components are set up, so the reset reason is
+    # in place before the text sensor first publishes.
+    - priority: 200
+      then:
+        - lambda: |-
+            id(last_crash_reason) = aqs::reset_reason_string();
+            ESP_LOGI("boot", "Reset reason: %s", id(last_crash_reason).c_str());
+    - priority: -100
+      then:
       - delay: 5s
       - globals.set:
           id: led_ready
@@ -131,8 +171,36 @@ api:
     key: !secret api_encryption_key
 
 ota:
+  # Push OTA (flash.sh / ESPHome dashboard) — stays as the manual and
+  # recovery path.
   - platform: esphome
     password: !secret ota_password
+  # Pull OTA, used by the "Firmware" update entity below.
+  - platform: http_request
+
+# ----------------------------------------------------------------------------
+# Firmware updates (pull from the home update server)
+# ----------------------------------------------------------------------------
+# Every 6 h the board fetches
+#   ${update_server}/${device_slug}/manifest.json
+# from the update server on the LAN (Proxmox LXC, see docs/ota-server.md).
+# If the manifest version differs from this build's project version, HA
+# shows a regular "Update available" under Settings → Updates. Nothing
+# installs until you click Install there; the MD5 from the manifest is
+# checked before the new image is booted.
+#
+# Each board has its own manifest URL (device_slug), so a board only ever
+# receives the image built for its room and variant (e.g. Kueche + PM).
+# Thresholds, LED brightness etc. live in flash preferences and survive.
+http_request:
+  timeout: 10s
+
+update:
+  - platform: http_request
+    id: firmware_update
+    name: "Firmware"
+    source: "${update_server}/${device_slug}/manifest.json"
+    update_interval: 6h
 
 wifi:
   ssid: !secret wifi_ssid
@@ -164,9 +232,12 @@ time:
         minutes: 0
         hours: 0
         then:
-          - globals.set: { id: time_green,  value: '0' }
-          - globals.set: { id: time_yellow, value: '0' }
-          - globals.set: { id: time_red,    value: '0' }
+          - globals.set: { id: time_green,       value: '0' }
+          - globals.set: { id: time_yellow,      value: '0' }
+          - globals.set: { id: time_red,         value: '0' }
+          - globals.set: { id: time_green_live,  value: '0' }
+          - globals.set: { id: time_yellow_live, value: '0' }
+          - globals.set: { id: time_red_live,    value: '0' }
 
 
 # ----------------------------------------------------------------------------
@@ -202,6 +273,37 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  # --- Last LED state applied by update_air_quality_led ---
+  # Lets the script skip no-op writes. Every perform() does an instant
+  # set_immediately_() that aborts the Critical Pulse fade in progress and
+  # snaps the LED to user_brightness. With CO2 + VOC both triggering the
+  # script that happened every ~15 s (every ~2.5 s in boost mode) and made
+  # the pulse stutter. Sentinels (-1) make the first update after boot apply.
+  - id: led_last_r
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_g
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_b
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_brightness
+    type: float
+    restore_value: false
+    initial_value: '-1.0'
+  - id: led_last_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: led_last_pulse
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
   # --- Peak observations since boot (reset by "Reset Peak Values" button) ---
   # Initialized to impossible-in-practice values so the first real reading
   # always wins (e.g. temp_min starts at +100°C, not 0, so a 22°C reading
@@ -229,14 +331,24 @@ globals:
   - id: peak_rh_max
     type: float
     restore_value: false
-    initial_value: '0.0'
+    initial_value: '-100.0'
   - id: peak_rh_min
     type: float
     restore_value: false
     initial_value: '100.0'
 
   # --- Daily air quality time counters (seconds) ---
-  # Persisted so a mid-day reboot doesn't lose the day's data.
+  # Split into a persisted base and a live accumulator, for flash endurance.
+  #
+  # These used to be a single set of restore_value globals incremented once a
+  # second. ESPHome flushes dirty preferences on its own timer (default 60s),
+  # so that meant ~1440 NVS writes a day, every day, forever — and it dragged
+  # every other preference (brightness, thresholds) into each of those writes.
+  #
+  # Now the 1s tick only touches the non-persisted *_live accumulators, and a
+  # 15-minute interval folds them into the persisted base. ~96 writes a day
+  # instead of ~1440, and a crash costs at most 15 minutes of counter.
+  # The displayed sensors report base + live, so nothing looks different.
   - id: time_green
     type: uint32_t
     restore_value: true
@@ -249,14 +361,18 @@ globals:
     type: uint32_t
     restore_value: true
     initial_value: '0'
-
-  # --- Extra fault contribution from optional packages ---
-  # Stays false in base firmware. The PM package sets this true whenever
-  # PM2.5 has no valid reading — covers both missing on I2C and not reporting.
-  - id: extra_fault
-    type: bool
+  - id: time_green_live
+    type: uint32_t
     restore_value: false
-    initial_value: 'false'
+    initial_value: '0'
+  - id: time_yellow_live
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: time_red_live
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
 
   # --- PM sensor addon presence ---
   # Probed via raw I2C write to 0x12 on boot and every 30s.
@@ -268,15 +384,35 @@ globals:
     restore_value: false
     initial_value: 'false'
 
+  # --- Stuck-detection test harness ---
+  # Set by the "Debug Freeze BMP280" switch. While true, the fault interval
+  # feeds the detector the BMP280 values captured at the moment the switch was
+  # flipped instead of the live ones — simulating exactly the latch-up that
+  # motivated this whole fault model, without waiting for one to happen.
+  - id: debug_freeze_bmp
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: debug_freeze_bmp_t
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: debug_freeze_bmp_p
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+
   # --- Diagnostics ---
   - id: reboot_count
     type: uint32_t
     restore_value: true
     initial_value: '0'
+  # Written on every boot from esp_reset_reason(). No longer persisted: it
+  # describes the CURRENT boot, and it is always set before anything reads it.
   - id: last_crash_reason
     type: std::string
-    restore_value: true
-    initial_value: '"None"'
+    restore_value: false
+    initial_value: '"Unknown"'
 
 
 # ----------------------------------------------------------------------------
@@ -381,12 +517,22 @@ number:
 # ----------------------------------------------------------------------------
 # Boost mode
 # ----------------------------------------------------------------------------
-# A HA switch that flips all four sensors from 30s update intervals down
-# to 5s for fast feedback (e.g. while cooking). Restores 30s when off.
+# A HA switch that flips the sensors from 30s update intervals down to 5s for
+# fast feedback (e.g. while cooking). Restores 30s when off.
+#
+# It re-polls the DERIVED template sensors too, not just the four hardware
+# pollers. Boost used to only speed up the raw chips, which left the entities
+# people actually look at — Temperature, Humidity, Absolute Humidity, Dew
+# Point, Air Quality Score — sitting at 30s. Pressing "Boost" made the LED and
+# CO2 responsive while the displayed temperature stayed sluggish.
 #
 # Important: uses stop_poller/start_poller instead of call_setup — the
 # latter re-runs the sensor's chip-level init (including new I2C setup
 # commands) which reliably wedges the SCD41 and SGP41.
+#
+# Not re-polled: the stuck detector's own interval, which stays at 30s by
+# design (see fault_sample_interval), and the PM package's sensors, which the
+# base firmware cannot reference.
 switch:
   - platform: template
     name: "Boost Mode"
@@ -396,34 +542,49 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - logger.log: "Boost mode ON — 5s intervals"
-      - lambda: |-
-          id(sht40_sensor).stop_poller();
-          id(sht40_sensor).set_update_interval(5000);
-          id(sht40_sensor).start_poller();
-          id(bmp280_sensor).stop_poller();
-          id(bmp280_sensor).set_update_interval(5000);
-          id(bmp280_sensor).start_poller();
-          id(scd41_sensor).stop_poller();
-          id(scd41_sensor).set_update_interval(5000);
-          id(scd41_sensor).start_poller();
-          id(sgp41_sensor).stop_poller();
-          id(sgp41_sensor).set_update_interval(5000);
-          id(sgp41_sensor).start_poller();
+      - script.execute:
+          id: apply_update_interval
+          interval_ms: 5000
     turn_off_action:
       - logger.log: "Boost mode OFF — back to 30s intervals"
+      - script.execute:
+          id: apply_update_interval
+          interval_ms: 30000
+
+  # --------------------------------------------------------------------------
+  # Stuck-detection test harness
+  # --------------------------------------------------------------------------
+  # Freezes the BMP280 values *as seen by the stuck detector* at whatever they
+  # read when the switch was flipped. The sensor itself keeps publishing
+  # normally, so this isolates the stuck path: it proves the detector, the
+  # per-chip binary sensor, the Fault Detail string and the fault LED all fire,
+  # end to end, on a real board.
+  #
+  # Expect the fault after one full window of frozen samples — 15 min at the
+  # default cadence, or ~1 min if flashed with `-s fault_sample_interval 2s`.
+  # Switching it off clears the fault one window later.
+  #
+  # Same philosophy as the "Test Fault LED" button: verifying the alarm path
+  # should not require waiting for a real failure.
+  - platform: template
+    name: "Debug Freeze BMP280"
+    id: debug_freeze_bmp_switch
+    icon: "mdi:snowflake"
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
       - lambda: |-
-          id(sht40_sensor).stop_poller();
-          id(sht40_sensor).set_update_interval(30000);
-          id(sht40_sensor).start_poller();
-          id(bmp280_sensor).stop_poller();
-          id(bmp280_sensor).set_update_interval(30000);
-          id(bmp280_sensor).start_poller();
-          id(scd41_sensor).stop_poller();
-          id(scd41_sensor).set_update_interval(30000);
-          id(scd41_sensor).start_poller();
-          id(sgp41_sensor).stop_poller();
-          id(sgp41_sensor).set_update_interval(30000);
-          id(sgp41_sensor).start_poller();
+          id(debug_freeze_bmp_t) = id(bmp280_temperature).state;
+          id(debug_freeze_bmp_p) = id(bmp280_pressure).state;
+          id(debug_freeze_bmp) = true;
+          ESP_LOGW("debug", "BMP280 freeze simulation ON — detector pinned to "
+                            "T=%.6f C P=%.6f hPa",
+                   id(debug_freeze_bmp_t), id(debug_freeze_bmp_p));
+    turn_off_action:
+      - lambda: |-
+          id(debug_freeze_bmp) = false;
+          ESP_LOGW("debug", "BMP280 freeze simulation OFF");
 
 
 # ============================================================================
@@ -544,11 +705,17 @@ sensor:
   #   1. Collect all sensors that have a valid state.
   #   2. Compute the median.
   #   3. Reject any sensor whose reading differs from the median by more
-  #      than 2°C — considered "drifting" and excluded from the average.
+  #      than DRIFT_LIMIT_C (1.5°C) — and raise a drift fault for it.
   #   4. From the remaining healthy sensors, compute a weighted mean with
   #      SHT40 weighted 2× (it's the highest-accuracy reference).
   #
-  # Result: robust to any single sensor drifting or failing.
+  # Three chips sitting in one enclosure cannot legitimately disagree by
+  # 1.5°C. Earlier revisions quietly compensated offsets of nearly 3°C and
+  # only annotated them in a diagnostic string; that is how a latched-up
+  # BMP280 stayed invisible for two weeks. Anything past the limit is now
+  # excluded AND faulted — never silently compensated.
+  #
+  # Result: robust to any single sensor drifting or failing, and loud about it.
   - platform: template
     name: "Temperature"
     id: temperature_main
@@ -558,35 +725,70 @@ sensor:
     accuracy_decimals: 1
     update_interval: 30s
     lambda: |-
-      std::vector<float> values;
+      // Sources are tagged with the chip they came from, so the SHT40
+      // weighting and the drift bookkeeping are exact rather than inferred
+      // by comparing float values back to the sensor they came from.
+      struct Src { uint8_t chip; float v; bool is_ref; };
+      std::vector<Src> srcs;
       if (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state))
-        values.push_back(id(sht40_temperature).state);
+        srcs.push_back({aqs::CHIP_SHT40,  id(sht40_temperature).state,  true});
       if (id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state))
-        values.push_back(id(bmp280_temperature).state);
+        srcs.push_back({aqs::CHIP_BMP280, id(bmp280_temperature).state, false});
       if (id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state))
-        values.push_back(id(scd41_temperature).state);
-      if (values.empty()) return NAN;
-      if (values.size() == 1) return values[0];
+        srcs.push_back({aqs::CHIP_SCD41,  id(scd41_temperature).state,  false});
 
+      // Drift verdicts are rebuilt from scratch on every cycle, so a chip
+      // that comes back into agreement clears its own fault.
+      aqs::set_drift(aqs::CHIP_SHT40,  false, 0.0f);
+      aqs::set_drift(aqs::CHIP_BMP280, false, 0.0f);
+      aqs::set_drift(aqs::CHIP_SCD41,  false, 0.0f);
+
+      if (srcs.empty()) return NAN;
+      if (srcs.size() == 1) return srcs[0].v;   // nothing to cross-check against
+
+      std::vector<float> values;
+      for (auto &s : srcs) values.push_back(s.v);
       std::sort(values.begin(), values.end());
       float median = values.size() % 2
         ? values[values.size() / 2]
         : (values[values.size() / 2 - 1] + values[values.size() / 2]) / 2.0f;
 
-      std::vector<float> healthy;
-      for (float v : values) {
-        if (fabsf(v - median) <= 2.0f) healthy.push_back(v);
+      const float LIMIT = aqs::DRIFT_LIMIT_C;
+
+      // Two sources that disagree: the median is just their midpoint and says
+      // nothing about which one is wrong. Trust the SHT40 if it is one of them
+      // (±0.2°C reference part) and fault the other.
+      if (srcs.size() == 2 && fabsf(srcs[0].v - srcs[1].v) > LIMIT) {
+        int ref = -1;
+        for (size_t i = 0; i < srcs.size(); i++) if (srcs[i].is_ref) ref = (int) i;
+        if (ref >= 0) {
+          const Src &bad = srcs[ref == 0 ? 1 : 0];
+          aqs::set_drift(bad.chip, true, bad.v - srcs[ref].v);
+          return srcs[ref].v;
+        }
+        // Neither is the reference part: we cannot tell which one lies, so
+        // fault both and hand back the midpoint as the least-bad estimate.
+        for (auto &s : srcs) aqs::set_drift(s.chip, true, s.v - median);
+        return median;
+      }
+
+      // Three sources (or two that agree): anything further than LIMIT from
+      // the median is faulted and dropped.
+      std::vector<Src> healthy;
+      for (auto &s : srcs) {
+        float d = s.v - median;
+        if (fabsf(d) > LIMIT) {
+          aqs::set_drift(s.chip, true, d);
+          continue;
+        }
+        healthy.push_back(s);
       }
       if (healthy.empty()) return median;
 
       float sum = 0.0f, weight_total = 0.0f;
-      for (float v : healthy) {
-        float w = 1.0f;
-        if (id(sht40_temperature).has_state()
-            && fabsf(v - id(sht40_temperature).state) < 0.01f) {
-          w = 2.0f;
-        }
-        sum += v * w;
+      for (auto &s : healthy) {
+        float w = s.is_ref ? 2.0f : 1.0f;   // SHT40 is the accuracy reference
+        sum += s.v * w;
         weight_total += w;
       }
       return sum / weight_total;
@@ -720,42 +922,83 @@ sensor:
   # DIAGNOSTIC SENSORS
   # --------------------------------------------------------------------------
 
-  # Per-sensor health, 100% if publishing a valid state, 0% otherwise.
-  # Trivial today (a sensor is either alive or dead), but wired as
-  # individual entities so future logic (staleness detection, drift
-  # tracking) can plug in without touching the fault LED logic.
+  # Per-sensor health, sourced from the shared fault report in fault_detect.h:
+  #   100 — publishing valid data and in agreement with the other chips
+  #    50 — still publishing, but frozen (stuck) or drifting out of consensus
+  #     0 — at least one of the chip's channels has no data at all
+  #
+  # The 50% level is the one that matters: it is where a latched-up sensor
+  # that keeps serving the same register value now lands.
   - platform: template
     name: "SCD41 Health"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: |-
-      return (id(co2_value).has_state() && !isnan(id(co2_value).state)) ? 100.0f : 0.0f;
+    lambda: 'return aqs::chip_health(aqs::CHIP_SCD41);'
   - platform: template
     name: "SGP41 Health"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: |-
-      return (id(voc_index).has_state() && !isnan(id(voc_index).state)) ? 100.0f : 0.0f;
+    lambda: 'return aqs::chip_health(aqs::CHIP_SGP41);'
   - platform: template
     name: "SHT40 Health"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: |-
-      return (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state)) ? 100.0f : 0.0f;
+    lambda: 'return aqs::chip_health(aqs::CHIP_SHT40);'
   - platform: template
     name: "BMP280 Health"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: |-
-      return (id(bmp280_pressure).has_state() && !isnan(id(bmp280_pressure).state)) ? 100.0f : 0.0f;
+    lambda: 'return aqs::chip_health(aqs::CHIP_BMP280);'
+
+  # --- Stuck-detection window spans (max - min over the last 15 minutes) ---
+  # These are exactly the numbers the stuck thresholds in fault_detect.h are
+  # compared against, exposed so the thresholds can be tuned against a real
+  # room instead of guessed. A healthy sensor in a still room wanders a few
+  # LSBs; a frozen one reads exactly 0.000. Unavailable until the window has
+  # filled (15 min) and after any gap in the data.
+  - platform: template
+    name: "Span SHT40 Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_SHT40_T);'
+  - platform: template
+    name: "Span BMP280 Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_BMP280_T);'
+  - platform: template
+    name: "Span BMP280 Pressure"
+    unit_of_measurement: "hPa"
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_BMP280_P);'
+  - platform: template
+    name: "Span SCD41 Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_SCD41_T);'
+  - platform: template
+    name: "Span SCD41 CO2"
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return aqs::span_or_nan(aqs::SIG_SCD41_CO2);'
 
   # --- Peak values observed since last boot or "Reset Peak Values" press ---
   - platform: template
@@ -797,7 +1040,7 @@ sensor:
     accuracy_decimals: 1
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(peak_rh_max);'
+    lambda: 'return id(peak_rh_max) > -50.0f ? id(peak_rh_max) : NAN;'
   - platform: template
     name: "Peak Humidity Min"
     unit_of_measurement: "%"
@@ -813,21 +1056,21 @@ sensor:
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_green) / 60.0f;'
+    lambda: 'return (id(time_green) + id(time_green_live)) / 60.0f;'
   - platform: template
     name: "Time Yellow Today"
     unit_of_measurement: "min"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_yellow) / 60.0f;'
+    lambda: 'return (id(time_yellow) + id(time_yellow_live)) / 60.0f;'
   - platform: template
     name: "Time Red Today"
     unit_of_measurement: "min"
     accuracy_decimals: 0
     entity_category: diagnostic
     update_interval: 60s
-    lambda: 'return id(time_red) / 60.0f;'
+    lambda: 'return (id(time_red) + id(time_red_live)) / 60.0f;'
 
   # --- Boot / uptime counters ---
   - platform: template
@@ -901,53 +1144,75 @@ text_sensor:
                days, hours, minutes, (unsigned) id(reboot_count));
       return {std::string(buf)};
 
-  # Placeholder for future ESP32 crash-reason capture. Populated on next
-  # boot after a crash if we wire in an esp32.crash reader (not yet done).
+  # Why this boot happened, straight from esp_reset_reason(). Decisive for
+  # this board: a latched-up sensor survives a software reset and only clears
+  # on a real power cycle, so "did it actually lose power?" is the first
+  # question whenever a chip does or does not come back. See reset_reason.h.
   - platform: template
-    name: "Last Crash Reason"
-    icon: "mdi:alert-circle-outline"
+    name: "Last Reset Reason"
+    icon: "mdi:restart-alert"
     entity_category: diagnostic
     update_interval: 300s
     lambda: |-
       return {id(last_crash_reason)};
 
-  # Which temperature sensors currently contribute to the consolidated
-  # value, with drift annotations for any sensor that disagrees with the
-  # consensus by more than 2°C. Example strings:
-  #   "SHT40, BMP280, SCD41"                    — all in agreement
-  #   "SHT40, BMP280, SCD41 (+2.8 drift)"       — SCD41 is drifting hot
+  # Which temperature sensors are reporting, and what the fusion decided
+  # about each. Annotations are read back from the fault model rather than
+  # recomputed here, so this string can never disagree with what the fusion
+  # actually did. Example strings:
+  #   "SHT40, BMP280, SCD41"                       — all in agreement
+  #   "SHT40, BMP280 (-2.9 EXCLUDED), SCD41"       — BMP280 dropped + faulted
+  #   "SHT40, BMP280 (STUCK), SCD41"               — BMP280 frozen but in range
   - platform: template
     name: "Temperature Sources"
     icon: "mdi:thermometer-check"
     entity_category: diagnostic
     update_interval: 60s
     lambda: |-
-      std::vector<std::pair<std::string,float>> sensors;
-      if (id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state))
-        sensors.push_back({"SHT40", id(sht40_temperature).state});
-      if (id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state))
-        sensors.push_back({"BMP280", id(bmp280_temperature).state});
-      if (id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state))
-        sensors.push_back({"SCD41", id(scd41_temperature).state});
-      if (sensors.empty()) return {"none available"};
-      if (!id(temperature_main).has_state()) return {"computing..."};
-
-      float main = id(temperature_main).state;
+      struct Src { const char *name; uint8_t chip; uint8_t sig; bool ok; };
+      const Src SRC[3] = {
+        {"SHT40",  aqs::CHIP_SHT40,  aqs::SIG_SHT40_T,
+         id(sht40_temperature).has_state()  && !isnan(id(sht40_temperature).state)},
+        {"BMP280", aqs::CHIP_BMP280, aqs::SIG_BMP280_T,
+         id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state)},
+        {"SCD41",  aqs::CHIP_SCD41,  aqs::SIG_SCD41_T,
+         id(scd41_temperature).has_state()  && !isnan(id(scd41_temperature).state)},
+      };
       std::string result;
-      for (auto &s : sensors) {
+      for (auto &s : SRC) {
+        if (!s.ok) continue;
         if (!result.empty()) result += ", ";
-        result += s.first;
-        float d = s.second - main;
-        if (fabsf(d) > 2.0f) {
-          char buf[16];
-          snprintf(buf, sizeof(buf), " (%+.1f drift)", d);
+        result += s.name;
+        if (aqs::drifting(s.chip)) {
+          char buf[32];
+          snprintf(buf, sizeof(buf), " (%+.1f EXCLUDED)", aqs::drift_amount(s.chip));
           result += buf;
+        } else if (aqs::stuck(s.sig)) {
+          result += " (STUCK)";
         }
       }
+      if (result.empty()) return {"none available"};
       return {result};
+
+  # What is currently faulted, chip by chip and channel by channel, e.g.
+  #   "BMP280 stuck (temperature+pressure), BMP280 drift -2.9 °C"
+  #   "SCD41 offline (CO2)"
+  #   "OK"
+  - platform: template
+    name: "Fault Detail"
+    icon: "mdi:alert-circle-check-outline"
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: 'return {aqs::cached().describe()};'
 
   # Same as Temperature Sources but for humidity, with a 10% RH drift
   # threshold. Only SHT40 and SCD41 measure humidity.
+  #
+  # Deliberately NOT wired into the fault model: the SCD41's humidity channel
+  # is spec'd at roughly ±6% RH against the SHT40's ±1.8%, so a 10% spread
+  # between them is within what two healthy parts can produce. Faulting on it
+  # would be a false-positive generator. A frozen SCD41 is caught through its
+  # temperature and CO2 channels instead.
   - platform: template
     name: "Humidity Sources"
     icon: "mdi:water-check"
@@ -1108,7 +1373,7 @@ button:
           id(peak_nox)      = 0.0f;
           id(peak_temp_max) = -100.0f;
           id(peak_temp_min) = 100.0f;
-          id(peak_rh_max)   = 0.0f;
+          id(peak_rh_max)   = -100.0f;
           id(peak_rh_min)   = 100.0f;
           ESP_LOGI("peak", "Peak values reset");
 
@@ -1128,6 +1393,13 @@ button:
 # path when CO2 is unavailable. Each source has its own configurable
 # yellow/red/pulse thresholds sourced from HA Number entities.
 #
+# "Unavailable" includes frozen, not just missing. A latched-up SCD41 keeps
+# republishing the same number forever, which would otherwise pin the LED to
+# whatever colour it happened to be showing when the chip died — a green LED
+# asserting the air is fine, indefinitely, with nobody any the wiser. The
+# fault LED would be lit next to it, but the air quality LED is the one people
+# actually read, so it has to stop trusting the stuck channel itself.
+#
 # Contract:
 #   * Do nothing until led_ready is true (guards WS2812 driver init).
 #   * Preserve the user's brightness and on/off preference; only update
@@ -1136,6 +1408,29 @@ button:
 #     both CO2 and VOC arrive back-to-back.
 # ============================================================================
 script:
+  # Re-poll every measurement component at a new cadence. Single definition so
+  # the on and off paths of Boost Mode cannot drift apart.
+  - id: apply_update_interval
+    parameters:
+      interval_ms: int
+    then:
+      - lambda: |-
+          for (auto *c : {
+                 (PollingComponent *) id(sht40_sensor),
+                 (PollingComponent *) id(bmp280_sensor),
+                 (PollingComponent *) id(scd41_sensor),
+                 (PollingComponent *) id(sgp41_sensor),
+                 (PollingComponent *) id(temperature_main),
+                 (PollingComponent *) id(humidity_main),
+                 (PollingComponent *) id(absolute_humidity),
+                 (PollingComponent *) id(dew_point),
+                 (PollingComponent *) id(air_quality_score),
+               }) {
+            c->stop_poller();
+            c->set_update_interval((uint32_t) interval_ms);
+            c->start_poller();
+          }
+
   - id: update_air_quality_led
     then:
       - lambda: |-
@@ -1155,7 +1450,11 @@ script:
           bool  have_source = false;
           float value = 0.0f, t_yellow = 0.0f, t_red = 0.0f, t_pulse = 0.0f;
 
-          if (id(co2_value).has_state() && !isnan(id(co2_value).state)) {
+          bool co2_usable = id(co2_value).has_state()
+                         && !isnan(id(co2_value).state)
+                         && !aqs::cached().stuck[aqs::SIG_SCD41_CO2];
+
+          if (co2_usable) {
             value    = id(co2_value).state;
             t_yellow = id(threshold_co2_yellow).state;
             t_red    = id(threshold_co2_red).state;
@@ -1186,6 +1485,34 @@ script:
           // --- Apply, preserving user's on/off preference ---
           bool should_pulse = value >= t_pulse;
           bool should_be_on = id(user_wants_led_on);
+
+          // --- Skip no-op writes ---
+          // perform() always does an instant set that aborts a running
+          // Critical Pulse fade (ESPHome drops the repeated set_effect but
+          // still snaps brightness to user_brightness), so only touch the
+          // LED when something we control changed. The light's real on/off
+          // and effect state are checked as well, so a manual change in HA
+          // (e.g. effect set to None) is still corrected on the next
+          // reading. Brightness isn't compared against the live value
+          // because the pulse effect modulates it.
+          auto *led = id(air_quality_led);
+          bool led_matches =
+              led->remote_values.is_on() == should_be_on &&
+              (!should_be_on ||
+               (led->get_effect_name() == "Critical Pulse") == should_pulse);
+          bool changed =
+              r != id(led_last_r) || g != id(led_last_g) || b != id(led_last_b) ||
+              brightness   != id(led_last_brightness) ||
+              should_be_on != id(led_last_on) ||
+              should_pulse != id(led_last_pulse);
+          if (!changed && led_matches) return;
+
+          id(led_last_r) = r;
+          id(led_last_g) = g;
+          id(led_last_b) = b;
+          id(led_last_brightness) = brightness;
+          id(led_last_on)    = should_be_on;
+          id(led_last_pulse) = should_pulse;
 
           if (should_be_on) {
             auto call = id(air_quality_led).turn_on();
@@ -1225,12 +1552,26 @@ interval:
       - lambda: |-
           if (!id(led_ready)) return;
           if (!id(co2_value).has_state() || isnan(id(co2_value).state)) return;
+          // Do not accumulate against a reading we know is stale. A frozen
+          // SCD41 keeps has_state() green forever, so the old check would have
+          // poured 14 days straight into whichever bucket it was stuck in —
+          // the exact failure this firmware now detects elsewhere.
+          if (aqs::cached().stuck[aqs::SIG_SCD41_CO2]) return;
           float v  = id(co2_value).state;
           float ty = id(threshold_co2_yellow).state;
           float tr = id(threshold_co2_red).state;
-          if      (v < ty) { id(time_green)  += 1; }
-          else if (v < tr) { id(time_yellow) += 1; }
-          else             { id(time_red)    += 1; }
+          if      (v < ty) { id(time_green_live)  += 1; }
+          else if (v < tr) { id(time_yellow_live) += 1; }
+          else             { id(time_red_live)    += 1; }
+
+  # Fold the live counters into the persisted base. See the globals section
+  # for why this is not done every second.
+  - interval: 15min
+    then:
+      - lambda: |-
+          id(time_green)  += id(time_green_live);   id(time_green_live)  = 0;
+          id(time_yellow) += id(time_yellow_live);  id(time_yellow_live) = 0;
+          id(time_red)    += id(time_red_live);     id(time_red_live)    = 0;
 
   # Peak value tracking. Every 10s is fast enough to catch transients
   # without hammering the globals every second.
@@ -1250,34 +1591,80 @@ interval:
             float v = id(nox_index).state;
             if (!isnan(v) && v > id(peak_nox)) id(peak_nox) = v;
           }
-          if (id(sht40_temperature).has_state()) {
-            float v = id(sht40_temperature).state;
+          // Track the consolidated entities, not raw SHT40. These peaks sit
+          // next to "Temperature" and "Humidity" in HA, so they have to be
+          // peaks OF those — previously they came from a single raw sensor
+          // that might have been dropped from the fusion for drifting.
+          if (id(temperature_main).has_state()) {
+            float v = id(temperature_main).state;
             if (!isnan(v)) {
               if (v > id(peak_temp_max)) id(peak_temp_max) = v;
               if (v < id(peak_temp_min)) id(peak_temp_min) = v;
             }
           }
-          if (id(sht40_humidity).has_state()) {
-            float v = id(sht40_humidity).state;
+          if (id(humidity_main).has_state()) {
+            float v = id(humidity_main).state;
             if (!isnan(v)) {
               if (v > id(peak_rh_max)) id(peak_rh_max) = v;
               if (v < id(peak_rh_min)) id(peak_rh_min) = v;
             }
           }
 
-  # Fault detection and LED drive. A sensor is considered failed if it
-  # has no published state or its state is NaN. We drive the fault LED
-  # directly here instead of relying on the binary_sensor's on_state
-  # trigger, which would only fire on transitions — not while the state
-  # persists.
-  - interval: 30s
+  # Fault detection and LED drive. This is the only place the fault model is
+  # advanced: it samples every monitored channel, ages the stuck-detection
+  # windows one tick, and caches a single verdict that every other consumer
+  # (binary sensors, health sensors, Fault Detail) reads back.
+  #
+  # Sampling deliberately runs on this fixed 30s cadence rather than off the
+  # sensors' own update_interval, so boost mode (which drops the sensors to
+  # 5s) cannot shrink the stuck window's 15-minute wall-clock span.
+  #
+  # We drive the fault LED directly here instead of relying on the
+  # binary_sensor's on_state trigger, which would only fire on transitions —
+  # not while the state persists.
+  - interval: ${fault_sample_interval}
     then:
       - lambda: |-
-          bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
-          bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
-          bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
-          bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
-          bool is_fault = !(scd_ok && sht_ok && bmp_ok && voc_ok) || id(extra_fault);
+          // --- Stage every channel this firmware owns ---
+          // BMP280 temperature and pressure are staged separately: they are
+          // independent ADC paths and either can freeze on its own. The old
+          // code only ever looked at pressure. The SGP41 VOC index is staged
+          // for liveness but never stuck-checked — it parks on exactly 100 in
+          // clean stable air, so "flat" is its healthy state.
+          aqs::observe(aqs::SIG_SHT40_T,
+                       id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state),
+                       id(sht40_temperature).state);
+          aqs::observe(aqs::SIG_SCD41_T,
+                       id(scd41_temperature).has_state() && !isnan(id(scd41_temperature).state),
+                       id(scd41_temperature).state);
+          aqs::observe(aqs::SIG_SCD41_CO2,
+                       id(co2_value).has_state() && !isnan(id(co2_value).state),
+                       id(co2_value).state);
+          aqs::observe(aqs::SIG_SGP41_VOC,
+                       id(voc_index).has_state() && !isnan(id(voc_index).state),
+                       id(voc_index).state);
+
+          bool bmp_t_ok = id(bmp280_temperature).has_state() && !isnan(id(bmp280_temperature).state);
+          bool bmp_p_ok = id(bmp280_pressure).has_state()    && !isnan(id(bmp280_pressure).state);
+          float bmp_t = id(bmp280_temperature).state;
+          float bmp_p = id(bmp280_pressure).state;
+          if (id(debug_freeze_bmp)) {   // "Debug Freeze BMP280" switch
+            bmp_t = id(debug_freeze_bmp_t);
+            bmp_p = id(debug_freeze_bmp_p);
+            bmp_t_ok = bmp_p_ok = true;
+          }
+          aqs::observe(aqs::SIG_BMP280_T, bmp_t_ok, bmp_t);
+          aqs::observe(aqs::SIG_BMP280_P, bmp_p_ok, bmp_p);
+
+          // --- Commit and decide ---
+          // Optional packages stage their own signals from their own interval;
+          // tick() commits whatever is staged, so ordering between the two does
+          // not matter. One verdict, cached and shared.
+          aqs::tick();
+          const aqs::Report &rep = aqs::evaluate();
+          bool is_fault = rep.any();
+          if (is_fault) ESP_LOGW("fault", "%s", rep.describe().c_str());
+
           id(sensor_fault).publish_state(is_fault);
           auto call = is_fault ? id(fault_led).turn_on() : id(fault_led).turn_off();
           call.perform();
@@ -1289,23 +1676,50 @@ interval:
 
 
 # ============================================================================
-# FAULT BINARY SENSOR (HA-side representation)
+# FAULT BINARY SENSORS (HA-side representation)
 # ============================================================================
-# Its state is published from the 30s fault-detection interval above.
-# The lambda here handles the boot-time initial read (before the interval
-# has a chance to fire) and gets re-evaluated whenever a source sensor
-# publishes.
+# All of these read the cached verdict computed by the 30s fault-detection
+# interval above. None of them re-derives the condition: the previous
+# revision kept a second copy of the fault expression here, which is exactly
+# the kind of duplication that lets the two drift apart.
+#
+# "Sensor Fault" stays the aggregate the fault LED follows. The per-chip
+# sensors below make it addressable — so an HA automation can say "the
+# bedroom BMP280 needs a power cycle" rather than just "something is wrong".
+#
+# Note on faults that need a power cycle: a latched-up sensor survives
+# App.safe_reboot(). If a chip stays stuck, the board has to lose power.
 binary_sensor:
   - platform: template
     name: "Sensor Fault"
     id: sensor_fault
     device_class: problem
-    lambda: |-
-      bool scd_ok = id(co2_value).has_state()         && !isnan(id(co2_value).state);
-      bool sht_ok = id(sht40_temperature).has_state() && !isnan(id(sht40_temperature).state);
-      bool bmp_ok = id(bmp280_pressure).has_state()   && !isnan(id(bmp280_pressure).state);
-      bool voc_ok = id(voc_index).has_state()         && !isnan(id(voc_index).state);
-      return !(scd_ok && sht_ok && bmp_ok && voc_ok) || id(extra_fault);
+    lambda: 'return aqs::cached().any();'
+
+  - platform: template
+    name: "SHT40 Fault"
+    id: fault_sht40
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return aqs::cached().chip_faulted(aqs::CHIP_SHT40);'
+  - platform: template
+    name: "BMP280 Fault"
+    id: fault_bmp280
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return aqs::cached().chip_faulted(aqs::CHIP_BMP280);'
+  - platform: template
+    name: "SCD41 Fault"
+    id: fault_scd41
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return aqs::cached().chip_faulted(aqs::CHIP_SCD41);'
+  - platform: template
+    name: "SGP41 Fault"
+    id: fault_sgp41
+    device_class: problem
+    entity_category: diagnostic
+    lambda: 'return aqs::cached().chip_faulted(aqs::CHIP_SGP41);'
 
   # Always present in both firmware variants. Updated via I2C probe (0x12)
   # on boot and every 30s — true whenever the PMSA003I is physically connected,

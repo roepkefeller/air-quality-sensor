@@ -2,11 +2,17 @@
 # ============================================================================
 # Flash helper for air-quality-sensor.
 #
-# Usage:
+# Usage (deployed boards — location and variant come from device-<name>.yaml):
+#   ./flash.sh kueche
+#   ./flash.sh wohnzimmer --device 192.168.178.132
+#
+# Usage (ad-hoc / new boards, legacy):
 #   ./flash.sh Schlafzimmer
-#   ./flash.sh Wohnzimmer --device 192.168.178.132
-#   ./flash.sh Schlafzimmer --pm
 #   ./flash.sh Schlafzimmer --pm --device 192.168.178.132
+#
+# Normally you don't need this for deployed boards any more: publish a
+# GitHub release and install it from HA (Settings → Updates). flash.sh
+# stays for development, first flash, and recovery.
 #
 # Flags:
 #   --pm      Flash the PM variant (air-quality-sensor-pm.yaml) which adds
@@ -38,7 +44,13 @@ for arg in "$@"; do
 done
 
 # --- Select firmware file ---
-if $PM_MODE; then
+# A known board name (device-<name>.yaml) pins location and variant.
+DEVICE_MODE=false
+if [ -f "device-${LOCATION}.yaml" ]; then
+    DEVICE_MODE=true
+    YAML="device-${LOCATION}.yaml"
+    grep -q 'air-quality-sensor-pm.yaml' "$YAML" && PM_MODE=true || PM_MODE=false
+elif $PM_MODE; then
     YAML="air-quality-sensor-pm.yaml"
 else
     YAML="air-quality-sensor.yaml"
@@ -64,10 +76,22 @@ if $PM_MODE; then
 fi
 
 echo "Flashing:"
-echo "  Location: $LOCATION"
+if $DEVICE_MODE; then
+    echo "  Board:    $LOCATION (location from $YAML)"
+else
+    echo "  Location: $LOCATION"
+fi
 echo "  Firmware: $VERSION"
 echo "  Variant:  $YAML"
 echo ""
+
+# Board configs have their own build directory each — no cache clash, no
+# location override.
+if $DEVICE_MODE; then
+    exec esphome \
+        -s firmware_version "$VERSION" \
+        run "$YAML" "${EXTRA_ARGS[@]}"
+fi
 
 # --- Auto-clean when switching between base and PM variant ---
 # ESPHome reuses the same .pioenvs build cache for both YAMLs (same device
