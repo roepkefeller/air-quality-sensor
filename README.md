@@ -269,6 +269,7 @@ Every installed board has a small config file in `firmware/` that fixes its inst
 | Küche | b7f8c0 | `device-kueche.yaml` | base + [PM add-on](#particle-sensor-add-on) | `Kueche` |
 | Schlafzimmer | b7f8b0 | `device-schlafzimmer.yaml` | base | `Schlafzimmer` |
 | Wohnzimmer | b7f8b8 | `device-wohnzimmer.yaml` | base | `Wohnzimmer` |
+| Julian | 85c0b0 | `device-julian.yaml` | base | `Julian` |
 
 Each file only sets `location`, `device_slug` (the board's folder on the update server) and its own build directory, then includes the base or PM firmware:
 

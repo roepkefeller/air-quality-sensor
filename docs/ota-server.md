@@ -22,6 +22,7 @@ Each board has its own config in `firmware/` that fixes room and variant:
 | Küche  | b7f8c0     | `device-kueche.yaml`      | base + PM    |
 | Schlafzimmer | b7f8b0 | `device-schlafzimmer.yaml` | base       |
 | Wohnzimmer | b7f8b8 | `device-wohnzimmer.yaml`  | base         |
+| Julian     | 85c0b0 | `device-julian.yaml`      | base         |
 
 Every board fetches only its own manifest (`/<slug>/manifest.json`), so the
 Küche image (with the particulate sensor) can't land on another board.
