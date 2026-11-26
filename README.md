@@ -269,6 +269,7 @@ Every installed board has a small config file in `firmware/` that fixes its inst
 | Küche | b7f8c0 | `device-kueche.yaml` | base + [PM add-on](#particle-sensor-add-on) | `Kueche` |
 | Schlafzimmer | b7f8b0 | `device-schlafzimmer.yaml` | base | `Schlafzimmer` |
 | Wohnzimmer | b7f8b8 | `device-wohnzimmer.yaml` | base | `Wohnzimmer` |
+| Julian | 85c0b0 | `device-julian.yaml` | base | `Julian` |
 
 Each file only sets `location`, `device_slug` (the board's folder on the update server) and its own build directory, then includes the base or PM firmware:
 
@@ -318,7 +319,7 @@ Checking only whether a sensor still publishes is not enough: in the field a BMP
 |------|-----------|
 | **Dead** | no value, or NaN |
 | **Frozen** | every sample over a 15 min window is bit-identical — real sensors always have some ADC noise, so this needs no threshold |
-| **Flat** | the value moves less than a per-signal span over 15 min *while another chip clearly moves* (so a quiet night doesn't trigger it) |
+| **Flat** | temperature only: the value moves less than 0.02 °C over 15 min *while another chip's temperature moves more than 0.1 °C* (so a quiet room doesn't trigger it; CO₂ from breathing doesn't count as movement) |
 | **Drift** | a temperature sensor disagrees with the consensus of the others by more than 1.5 °C |
 
 The detector samples every 30 s on its own schedule, so boost mode doesn't shorten the window. Stuck checks only start 20 minutes after boot. Self-calibrating signals that legitimately sit still (SGP41 VOC index, PM2.5 in clean air) are liveness-only; the PM add-on is watched through its 0.3 µm particle count instead, which always moves in real indoor air.
@@ -543,7 +544,7 @@ Details, troubleshooting and the bootstrap of new boards: [docs/ota-server.md](d
 
 ### CI
 
-[`.github/workflows/firmware-ci.yml`](.github/workflows/firmware-ci.yml) compiles all three board configs on every push with dummy secrets, runs the fault-detector unit tests, and checks that the OTA image ends up where the release build expects it. Nothing built there is published.
+[`.github/workflows/firmware-ci.yml`](.github/workflows/firmware-ci.yml) compiles all board configs on every push with dummy secrets, runs the fault-detector unit tests, and checks that the OTA image ends up where the release build expects it. Nothing built there is published.
 
 ---
 

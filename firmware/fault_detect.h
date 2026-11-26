@@ -16,9 +16,10 @@
 // So a sensor is now considered faulted if ANY of these hold:
 //
 //   1. dead   — no state, or NaN                     (the original check)
-//   2. stuck  — its value has not moved at all over  (new)
-//               a 15 minute window while another
-//               chip on the board clearly did move
+//   2. stuck  — its value is bit-identical over a    (new)
+//               15 minute window, or barely moves
+//               while another chip measuring the
+//               same quantity clearly did move
 //   3. drift  — it disagrees with the consensus of   (new)
 //               the other chips by more than 1.5 °C,
 //               which in a single enclosure is a
@@ -50,8 +51,28 @@
 //                     therefore it can be wrong: the SHT40 is the quietest
 //                     part on the board and can legitimately out-still its
 //                     own threshold on a calm night. So this rule fires only
-//                     when at least one signal on a DIFFERENT chip is clearly
-//                     moving, which rules out "the room simply went still".
+//                     when a signal of the SAME QUANTITY on a DIFFERENT chip
+//                     moved at least PEER_FACTOR times the flat threshold —
+//                     i.e. the room really changed and this chip did not
+//                     follow. That rules out "the room simply went still".
+//
+//                     Both halves of that peer condition were learned in the
+//                     field (v1.2.0, Julian's room, ~40 false alarms a day):
+//                       * Any-quantity peers: SCD41 CO2 moves by more than
+//                         2 ppm whenever someone breathes in the room, so
+//                         "a peer is moving" was true practically always and
+//                         the quiet-room guard never engaged. CO2 says
+//                         nothing about whether a temperature should move.
+//                       * Barely-moving peers: in a cold, steady room the
+//                         BMP280 (the smoothest of the three thermometers)
+//                         spanned 0.017-0.020 °C while the SHT40 spanned
+//                         0.04-0.08 °C. Both healthy, both just noise and a
+//                         slow drift — a peer one LSB above threshold proves
+//                         nothing.
+//
+//                     Consequence: only temperature (three chips) has peers.
+//                     Pressure and CO2 are single-chip quantities and get the
+//                     frozen rule only (flat_span == 0).
 //
 // Watch the "Span <signal>" diagnostic sensors for a few days before trusting
 // a flat_span; the frozen rule needs no such care.
@@ -151,9 +172,28 @@ static const uint16_t ARM_AFTER_SAMPLES = 40;
 // Drift beyond this between chips in one enclosure is a fault, not an offset.
 static const float DRIFT_LIMIT_C = 1.5f;
 
+// The flat rule needs a same-quantity peer on another chip whose span exceeds
+// PEER_FACTOR x the accused signal's flat_span. For temperature: 5 x 0.02 °C
+// = the room moved more than 0.1 °C in 15 min, which every healthy
+// thermometer in the same enclosure follows.
+static const float PEER_FACTOR = 5.0f;
+
+// --- Quantities ---------------------------------------------------------------
+// What a signal physically measures. Only signals of the same quantity can
+// vouch for each other in the flat rule.
+enum Quantity : uint8_t {
+  QTY_TEMPERATURE = 0,
+  QTY_PRESSURE,
+  QTY_CO2,
+  QTY_VOC_INDEX,
+  QTY_PM_MASS,
+  QTY_PM_COUNT,
+};
+
 struct SignalSpec {
   const char *label;  // channel name, e.g. "pressure"
   uint8_t chip;
+  uint8_t quantity;   // Quantity — peers must match it
   float flat_span;    // < 0 liveness only | == 0 frozen rule only
                       // > 0 frozen rule + flat rule at this max-min threshold
 };
@@ -164,27 +204,26 @@ inline const SignalSpec &spec(uint8_t sig) {
   //   BMP280  T  ~0.005 °C LSB     SCD41  CO2  1 ppm LSB, real air wanders
   //   BMP280  P  ~0.013 hPa RMS at 16x oversampling
   //
-  // Pressure is the tightest margin of the five: 30 samples of pure BMP280
-  // noise span roughly 0.05-0.09 hPa, so 0.05 sits close to the floor on a
-  // very calm day. The "Span BMP280 Pressure" diagnostic sensor reports the
-  // live value of exactly this quantity — watch it for a few days and raise
-  // the threshold here if it ever dips near 0.05 without the chip being
-  // frozen. A genuinely frozen register reads exactly 0.000.
+  // Pressure and CO2 are measured by one chip each, so they have no
+  // same-quantity peer and are frozen-rule only (0). That also retires the
+  // old 0.05 hPa pressure threshold, which sat right on the noise floor and
+  // did fire on healthy boards. A genuinely frozen register reads exactly
+  // 0.000 and is still caught.
   static const SignalSpec S[SIG_COUNT] = {
-      {"temperature", CHIP_SHT40, 0.02f},
-      {"temperature", CHIP_BMP280, 0.02f},
-      {"pressure", CHIP_BMP280, 0.05f},
-      {"temperature", CHIP_SCD41, 0.02f},
-      {"CO2", CHIP_SCD41, 2.00f},
-      {"VOC index", CHIP_SGP41, -1.00f},  // liveness only, see header comment
+      {"temperature", CHIP_SHT40, QTY_TEMPERATURE, 0.02f},
+      {"temperature", CHIP_BMP280, QTY_TEMPERATURE, 0.02f},
+      {"pressure", CHIP_BMP280, QTY_PRESSURE, 0.00f},
+      {"temperature", CHIP_SCD41, QTY_TEMPERATURE, 0.02f},
+      {"CO2", CHIP_SCD41, QTY_CO2, 0.00f},
+      {"VOC index", CHIP_SGP41, QTY_VOC_INDEX, -1.00f},  // liveness only, see header comment
       // PM2.5 mass concentration legitimately reads 0.0 µg/m³ in clean air for
       // hours on end, so flat says nothing about its health — liveness only.
-      {"PM2.5", CHIP_PMSA003I, -1.00f},
+      {"PM2.5", CHIP_PMSA003I, QTY_PM_MASS, -1.00f},
       // The 0.3 µm particle count is the opposite: indoor air always carries
       // thousands of them per 0.1 L and the number moves on every single read.
       // Bit-identical counts mean the sensor is serving a stale frame. Set to
       // 0 so ONLY the frozen rule applies — no threshold to get wrong.
-      {"0.3µm count", CHIP_PMSA003I, 0.00f},
+      {"0.3µm count", CHIP_PMSA003I, QTY_PM_COUNT, 0.00f},
   };
   return S[sig];
 }
@@ -398,12 +437,22 @@ inline bool signal_flat(uint8_t sig) {
   return window_span(sig, &s) && s <= spec(sig).flat_span;
 }
 
-// Is any signal on a *different* chip showing normal movement? This is what
-// separates "this chip is frozen" from "the whole room is perfectly still".
+// Did a signal of the same quantity on a *different* chip clearly move — by
+// more than PEER_FACTOR x this signal's flat threshold? This is what separates
+// "this chip stopped following the room" from "the room is simply still".
+// Other quantities never count: breathing moves CO2 without moving the
+// temperature.
 inline bool peer_moving(uint8_t sig) {
-  for (uint8_t i = 0; i < SIG_COUNT; i++)
-    if (spec(i).chip != spec(sig).chip && signal_moving(i))
+  const float need = PEER_FACTOR * spec(sig).flat_span;
+  for (uint8_t i = 0; i < SIG_COUNT; i++) {
+    if (spec(i).chip == spec(sig).chip || spec(i).quantity != spec(sig).quantity)
+      continue;
+    if (!stuck_checked(i))
+      continue;
+    float s;
+    if (window_span(i, &s) && s > need)
       return true;
+  }
   return false;
 }
 

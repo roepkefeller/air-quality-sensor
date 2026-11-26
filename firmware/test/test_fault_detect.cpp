@@ -422,6 +422,85 @@ static void test_pm_frozen_frame_is_caught() {
   CHECK(!r.chip_faulted(aqs::CHIP_SCD41));
 }
 
+// The v1.2.0 field false alarm (Julian's room, ~40x a day): a cold, steady
+// room. Every thermometer is healthy and only dithers / drifts slowly — the
+// smooth BMP280 dips just under 0.02 °C, the SHT40 and SCD41 sit at
+// 0.04-0.08 °C — while CO2 wanders by tens of ppm because someone is
+// breathing. Under the old any-quantity peer rule this accused the BMP280.
+static void test_still_cold_room_breathing_no_false_positive() {
+  scenario("still cold room, CO2 moving from breathing (v1.2.0 false alarm)");
+
+  for (int i = 0; i < 90; i++) {
+    obs(aqs::SIG_SHT40_T, 17.70f + wob(i, 0.025f));      // span 0.05 °C
+    obs(aqs::SIG_BMP280_T, 17.53f + wob(i + 1, 0.009f));  // span 0.018 °C
+    obs(aqs::SIG_BMP280_P, 1020.2f + wob(i + 3, 0.02f));  // span 0.04 hPa
+    obs(aqs::SIG_SCD41_T, 18.50f + wob(i + 2, 0.03f));    // span 0.06 °C
+    obs(aqs::SIG_SCD41_CO2, 905.0f + wob(i + 4, 20.0f));  // span 40 ppm
+    obs(aqs::SIG_SGP41_VOC, 150.0f + wob(i, 3.0f));
+    aqs::tick();
+  }
+
+  for (uint8_t s = 0; s < aqs::SIG_COUNT; s++)
+    CHECK(!aqs::stuck(s));
+  const aqs::Report &r = aqs::evaluate();
+  CHECK(!r.any());
+  CHECK_STR(r.describe(), "OK");
+}
+
+// CO2 must never vouch for a temperature: even a wildly moving CO2 next to a
+// flat (but not frozen) BMP280 is no evidence, as long as no other
+// thermometer moved.
+static void test_other_quantity_is_not_a_peer() {
+  scenario("CO2 movement is no peer for temperature");
+
+  for (int i = 0; i < 60; i++) {
+    obs(aqs::SIG_SHT40_T, 21.00f + wob(i, 0.005f));
+    obs(aqs::SIG_BMP280_T, 21.05f + wob(i + 1, 0.005f));
+    obs(aqs::SIG_BMP280_P, 1013.0f + wob(i + 3, 0.2f));
+    obs(aqs::SIG_SCD41_T, 21.10f + wob(i + 2, 0.005f));
+    obs(aqs::SIG_SCD41_CO2, 1200.0f + wob(i + 4, 150.0f));
+    obs(aqs::SIG_SGP41_VOC, 100.0f);
+    aqs::tick();
+  }
+  CHECK(!aqs::peer_moving(aqs::SIG_BMP280_T));
+  CHECK(!aqs::evaluate().any());
+}
+
+// The thing the flat rule is FOR: a degraded BMP280 that dithers by an LSB
+// or two (so the frozen rule can't see it) while the room clearly warms and
+// both other thermometers follow. That must still be caught.
+static void test_degraded_chip_in_changing_room_is_caught() {
+  scenario("degraded BMP280 dithering while the room warms");
+
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    const float ramp = 0.01f * i;  // +0.3 °C per 15 min window
+    obs(aqs::SIG_SHT40_T, 21.00f + ramp + wob(i, 0.01f));
+    obs(aqs::SIG_SCD41_T, 21.10f + ramp + wob(i + 2, 0.02f));
+    obs(aqs::SIG_BMP280_T, 21.05f + wob(i + 1, 0.005f));  // span 0.01, going nowhere
+    aqs::tick();
+  }
+  CHECK(aqs::stuck(aqs::SIG_BMP280_T));
+  CHECK(!aqs::stuck_exact(aqs::SIG_BMP280_T));
+  CHECK(!aqs::stuck(aqs::SIG_SHT40_T));
+  CHECK(!aqs::stuck(aqs::SIG_SCD41_T));
+  CHECK_STR(aqs::evaluate().describe(), "BMP280 flat (temperature)");
+}
+
+// Pressure has no second chip, so it is frozen-rule only: a calm-day span at
+// the noise floor (which tripped the old 0.05 hPa threshold) is healthy.
+static void test_calm_pressure_is_healthy() {
+  scenario("calm-day pressure at the noise floor is healthy");
+
+  for (int i = 0; i < 60; i++) {
+    feed_healthy(i);
+    obs(aqs::SIG_BMP280_P, 1013.2f + wob(i + 3, 0.015f));  // span 0.03 hPa
+    aqs::tick();
+  }
+  CHECK(!aqs::stuck(aqs::SIG_BMP280_P));
+  CHECK(!aqs::evaluate().any());
+}
+
 // ---------------------------------------------------------------------------
 // SENSITIVITY: this one documents a known weak spot rather than a guarantee.
 //
@@ -477,6 +556,10 @@ int main() {
   test_pm_missing_is_a_fault();
   test_pm_zero_mass_is_healthy();
   test_pm_frozen_frame_is_caught();
+  test_still_cold_room_breathing_no_false_positive();
+  test_other_quantity_is_not_a_peer();
+  test_degraded_chip_in_changing_room_is_caught();
+  test_calm_pressure_is_healthy();
   test_sensitivity_quiet_reference_noisy_peer();
 
   printf("\n%s (%d failure%s)\n\n", g_failures ? "FAILED" : "all passed",
