@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        device: [kueche, schlafzimmer, wohnzimmer]
+        device: [kueche, schlafzimmer, wohnzimmer, julian]
     steps:
       - uses: actions/checkout@v4
 
